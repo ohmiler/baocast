@@ -11,10 +11,21 @@ pub struct FlvWriter<W: Write> {
 }
 
 impl<W: Write> FlvWriter<W> {
-    pub fn new(mut out: W) -> io::Result<Self> {
-        // "FLV", version 1, flags = video only, header size 9, then PreviousTagSize0.
-        out.write_all(&[b'F', b'L', b'V', 1, 0x01, 0, 0, 0, 9, 0, 0, 0, 0])?;
+    pub fn new(mut out: W, has_audio: bool) -> io::Result<Self> {
+        // "FLV", version 1, flags (4 = audio, 1 = video), header size 9, then PreviousTagSize0.
+        let flags = if has_audio { 0x05 } else { 0x01 };
+        out.write_all(&[b'F', b'L', b'V', 1, flags, 0, 0, 0, 9, 0, 0, 0, 0])?;
         Ok(Self { out, sps: Vec::new(), pps: Vec::new(), sent_config: false })
+    }
+
+    /// The AAC decoder config (AudioSpecificConfig); must precede any audio frame.
+    pub fn write_audio_config(&mut self, config: &[u8]) -> io::Result<()> {
+        self.audio_tag(0, 0, config)
+    }
+
+    /// Writes one raw AAC frame.
+    pub fn write_audio(&mut self, frame: &[u8], ms: u32) -> io::Result<()> {
+        self.audio_tag(ms, 1, frame)
     }
 
     /// Remembers SPS/PPS given out of band (Annex-B), for encoders that don't repeat them in-stream.
@@ -84,6 +95,14 @@ impl<W: Write> FlvWriter<W> {
         self.tag(9, ms, &body)
     }
 
+    fn audio_tag(&mut self, ms: u32, packet_type: u8, payload: &[u8]) -> io::Result<()> {
+        // 0xAF = AAC, 44 kHz flag (always set for AAC), 16-bit, stereo.
+        let mut body = Vec::with_capacity(payload.len() + 2);
+        body.extend_from_slice(&[0xAF, packet_type]);
+        body.extend_from_slice(payload);
+        self.tag(8, ms, &body)
+    }
+
     fn tag(&mut self, kind: u8, ms: u32, body: &[u8]) -> io::Result<()> {
         let size = body.len() as u32;
         let mut header = [0u8; 11];
@@ -139,7 +158,7 @@ mod tests {
 
     #[test]
     fn waits_for_keyframe_then_writes_config_and_frame() {
-        let mut flv = FlvWriter::new(Vec::new()).unwrap();
+        let mut flv = FlvWriter::new(Vec::new(), false).unwrap();
         let header_len = 13;
         // A P-frame before any keyframe is dropped.
         flv.write_video(&[0, 0, 0, 1, 0x41, 9], 0, false).unwrap();
@@ -157,5 +176,22 @@ mod tests {
         let second = header_len + 11 + config_len + 4;
         assert_eq!(&out[second + 11..second + 13], &[0x17, 1]);
         assert_eq!(&out[second + 16..second + 22], &[0, 0, 0, 2, 0x65, 0xAA]);
+    }
+
+    #[test]
+    fn writes_audio_tags() {
+        let mut flv = FlvWriter::new(Vec::new(), true).unwrap();
+        flv.write_audio_config(&[0x11, 0x90]).unwrap();
+        flv.write_audio(&[1, 2, 3], 0x01_02_03_04).unwrap();
+        let out = flv.finish().unwrap();
+        assert_eq!(out[4], 0x05); // has audio and video
+
+        let first = 13;
+        assert_eq!(&out[first..first + 4], &[8, 0, 0, 4]); // audio tag, 4-byte body
+        assert_eq!(&out[first + 11..first + 15], &[0xAF, 0, 0x11, 0x90]);
+
+        let second = first + 11 + 4 + 4;
+        assert_eq!(&out[second + 4..second + 8], &[0x02, 0x03, 0x04, 0x01]); // ms with extension byte
+        assert_eq!(&out[second + 11..second + 16], &[0xAF, 1, 1, 2, 3]);
     }
 }
