@@ -16,8 +16,8 @@ use crate::amf::{self, Value};
 use crate::flv::{AUDIO, Sink, Tag, VIDEO};
 
 /// Twitch's own "Default" ingest, which routes to the nearest server.
-const TWITCH: &str = "rtmp://ingest.global-contribute.live-video.net/app";
-const YOUTUBE: &str = "rtmp://a.rtmp.youtube.com/live2";
+pub const TWITCH: &str = "rtmp://ingest.global-contribute.live-video.net/app";
+pub const YOUTUBE: &str = "rtmp://a.rtmp.youtube.com/live2";
 
 const CHUNK_SIZE: usize = 4096;
 /// Once this much media is waiting to be sent, the network is falling behind.
@@ -349,7 +349,7 @@ impl Session {
         let connect = Value::Object(vec![
             ("app".into(), Value::str(&target.app)),
             ("type".into(), Value::str("nonprivate")),
-            ("flashVer".into(), Value::str("FMLE/3.0 (compatible; Baocast)")),
+            ("flashVer".into(), Value::str("FMLE/3.0 (compatible; MilerCast)")),
             ("tcUrl".into(), Value::str(&target.tc_url)),
         ]);
         send_command(&mut writer, 0, "connect", 1, connect, vec![]).map_err(io_error)?;
@@ -515,7 +515,7 @@ fn metadata_message(m: &Metadata) -> Vec<u8> {
         ("framerate".into(), Value::Number(m.fps as f64)),
         ("videocodecid".into(), Value::Number(7.0)),
         ("videodatarate".into(), Value::Number(m.video_kbps as f64)),
-        ("encoder".into(), Value::str(concat!("Baocast ", env!("CARGO_PKG_VERSION")))),
+        ("encoder".into(), Value::str(concat!("MilerCast ", env!("CARGO_PKG_VERSION")))),
     ];
     if let Some(kbps) = m.audio_kbps {
         props.extend([

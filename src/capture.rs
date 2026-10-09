@@ -10,12 +10,18 @@ use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, HDC, HMONITOR, MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint,
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY,
+    MONITORINFO, MonitorFromPoint, MonitorFromWindow,
 };
+use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::System::WinRT::Direct3D11::IDirect3DDxgiInterfaceAccess;
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
-use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextW, IsWindowVisible};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GWL_EXSTYLE, GetClassNameW, GetWindowLongW, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+};
 use windows::core::{BOOL, Interface, Result, factory};
 
 use crate::gpu::Gpu;
@@ -143,16 +149,13 @@ fn create_texture(device: &ID3D11Device, width: u32, height: u32) -> Result<ID3D
     Ok(texture.unwrap())
 }
 
-/// Visible top-level windows that have a title.
+/// Windows worth capturing: visible and titled, but not tool windows or overlays,
+/// not windows the shell keeps hidden, and not MilerCast's own.
 pub fn list_windows() -> Vec<(HWND, String)> {
     unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let windows = unsafe { &mut *(lparam.0 as *mut Vec<(HWND, String)>) };
-        if unsafe { IsWindowVisible(hwnd) }.as_bool() {
-            let mut title = [0u16; 256];
-            let len = unsafe { GetWindowTextW(hwnd, &mut title) };
-            if len > 0 {
-                windows.push((hwnd, String::from_utf16_lossy(&title[..len as usize])));
-            }
+        if let Some(title) = unsafe { capturable_title(hwnd) } {
+            windows.push((hwnd, title));
         }
         true.into()
     }
@@ -161,6 +164,69 @@ pub fn list_windows() -> Vec<(HWND, String)> {
         let _ = EnumWindows(Some(collect), LPARAM(&mut windows as *mut _ as isize));
     }
     windows
+}
+
+unsafe fn capturable_title(hwnd: HWND) -> Option<String> {
+    unsafe {
+        if !IsWindowVisible(hwnd).as_bool() {
+            return None;
+        }
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        if ex_style & (WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0 | WS_EX_TRANSPARENT.0) != 0 {
+            return None; // overlays (GPU driver, Discord...) and helper windows
+        }
+        let mut cloaked = 0u32;
+        let got = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut u32 as *mut _, 4);
+        if got.is_ok() && cloaked != 0 {
+            return None; // e.g. suspended Store apps
+        }
+        let mut process = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut process));
+        if process == GetCurrentProcessId() {
+            return None;
+        }
+        let mut class = [0u16; 64];
+        let class_len = GetClassNameW(hwnd, &mut class);
+        let class = String::from_utf16_lossy(&class[..class_len.max(0) as usize]);
+        if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
+            return None;
+        }
+        let mut title = [0u16; 256];
+        let len = GetWindowTextW(hwnd, &mut title);
+        (len > 0).then(|| String::from_utf16_lossy(&title[..len as usize]))
+    }
+}
+
+/// The game, guessed as the window that exactly covers a monitor
+/// (fullscreen or borderless fullscreen). Maximised apps leave the taskbar
+/// visible, so they don't match.
+pub fn find_game() -> Option<(HWND, String)> {
+    list_windows().into_iter().find(|(hwnd, _)| unsafe { covers_monitor(*hwnd) })
+}
+
+unsafe fn covers_monitor(hwnd: HWND) -> bool {
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            return false;
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return false;
+        }
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        !monitor.0.is_null() && GetMonitorInfoW(monitor, &mut info).as_bool() && rect == info.rcMonitor
+    }
+}
+
+/// A monitor's size in pixels, for showing in menus.
+pub fn monitor_size(monitor: HMONITOR) -> (i32, i32) {
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    unsafe {
+        let _ = GetMonitorInfoW(monitor, &mut info);
+    }
+    let r = info.rcMonitor;
+    (r.right - r.left, r.bottom - r.top)
 }
 
 /// First visible window whose title contains `query` (case-insensitive).

@@ -2,6 +2,8 @@
 //! 48 kHz stereo float for us, so mixing is just adding samples.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
@@ -21,6 +23,22 @@ const MIX_DELAY: Duration = Duration::from_millis(100);
 /// Packets landing this close to where we expected them are treated as
 /// continuous, which hides timestamp jitter.
 const SNAP_FRAMES: i64 = (SAMPLE_RATE / 50) as i64; // 20 ms
+
+/// A volume that can change while streaming (1.0 = unchanged, 0.0 = muted).
+#[derive(Clone)]
+pub struct Gain(Arc<AtomicU32>);
+
+impl Gain {
+    pub fn new(value: f32) -> Self {
+        Self(Arc::new(AtomicU32::new(value.to_bits())))
+    }
+    pub fn set(&self, value: f32) {
+        self.0.store(value.to_bits(), Ordering::Relaxed);
+    }
+    pub fn get(&self) -> f32 {
+        f32::from_bits(self.0.load(Ordering::Relaxed))
+    }
+}
 
 pub struct Device {
     pub name: String,
@@ -91,12 +109,14 @@ struct Track {
     /// Interleaved stereo; `buffer[0]` sits at timeline frame `start`.
     buffer: VecDeque<f32>,
     start: i64,
-    gain: f32,
+    gain: Gain,
+    /// Loudest sample since the last `take_peak`, for level meters.
+    peak: f32,
 }
 
 impl Track {
-    fn new(gain: f32) -> Self {
-        Self { buffer: VecDeque::new(), start: 0, gain }
+    fn new(gain: Gain) -> Self {
+        Self { buffer: VecDeque::new(), start: 0, gain, peak: 0.0 }
     }
 
     /// Puts samples on the timeline at frame `at` (None: right after the previous packet).
@@ -119,7 +139,10 @@ impl Track {
             let skip = ((end - at) as usize * CHANNELS).min(samples.len());
             samples = &samples[skip..];
         }
-        self.buffer.extend(samples.iter().map(|s| s * self.gain));
+        let gain = self.gain.get();
+        let start = self.buffer.len();
+        self.buffer.extend(samples.iter().map(|s| s * gain));
+        self.peak = self.buffer.range(start..).fold(self.peak, |peak, s| peak.max(s.abs()));
     }
 
     /// Adds the samples for the frames starting at `from` into `out`.
@@ -153,7 +176,7 @@ pub struct Source {
 
 impl Source {
     /// With `loopback`, records what an output device plays instead of recording from it.
-    pub fn open(device: &Device, loopback: bool, gain: f32) -> Result<Self> {
+    pub fn open(device: &Device, loopback: bool, gain: Gain) -> Result<Self> {
         unsafe {
             let client: IAudioClient = device.device.Activate(CLSCTX_ALL, None)?;
             let format = WAVEFORMATEX {
@@ -200,6 +223,25 @@ impl Source {
         }
         Ok(())
     }
+
+    /// Reads and discards what was captured, returning its loudest sample.
+    /// For level meters before going live.
+    pub fn drain_peak(&mut self) -> Result<f32> {
+        let gain = self.track.gain.get();
+        let mut peak = 0.0f32;
+        unsafe {
+            while self.capture.GetNextPacketSize()? > 0 {
+                let (mut data, mut frames, mut flags) = (std::ptr::null_mut(), 0, 0);
+                self.capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
+                if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 && !data.is_null() {
+                    let samples = std::slice::from_raw_parts(data as *const f32, frames as usize * CHANNELS);
+                    peak = samples.iter().fold(peak, |peak, s| peak.max((s * gain).abs()));
+                }
+                self.capture.ReleaseBuffer(frames)?;
+            }
+        }
+        Ok(peak)
+    }
 }
 
 impl Drop for Source {
@@ -227,9 +269,8 @@ impl Mixer {
         let frames = (target - self.mixed).max(0) as usize;
         let mut out = vec![0.0; frames * CHANNELS];
         for source in self.sources.iter_mut().filter(|source| !source.failed) {
-            if let Err(e) = source.read(&self.timeline) {
+            if source.read(&self.timeline).is_err() {
                 // E.g. headphones unplugged: keep going without this source.
-                eprintln!("\nwarning: lost audio from \"{}\": {e}", source.name);
                 source.failed = true;
                 continue;
             }
@@ -240,6 +281,11 @@ impl Mixer {
             *sample = sample.clamp(-1.0, 1.0);
         }
         out
+    }
+
+    /// The loudest sample of each source (in the order given to `new`) since the last call.
+    pub fn take_peaks(&mut self) -> Vec<f32> {
+        self.sources.iter_mut().map(|s| std::mem::take(&mut s.track.peak)).collect()
     }
 }
 
@@ -255,14 +301,14 @@ mod tests {
 
     #[test]
     fn places_by_timestamp_and_fills_gaps_with_silence() {
-        let mut track = Track::new(1.0);
+        let mut track = Track::new(Gain::new(1.0));
         track.place(Some(4800), &[0.5; 4]); // 2 frames at 100 ms
         assert_eq!(mix(&mut track, 4799, 3), vec![0.0, 0.0, 0.5, 0.5, 0.5, 0.5]);
     }
 
     #[test]
     fn small_timestamp_jitter_stays_continuous() {
-        let mut track = Track::new(1.0);
+        let mut track = Track::new(Gain::new(1.0));
         track.place(Some(0), &[0.1; 4]);
         track.place(Some(5), &[0.2; 4]); // 3 frames late, inside the snap window
         assert_eq!(mix(&mut track, 0, 4), vec![0.1, 0.1, 0.1, 0.1, 0.2, 0.2, 0.2, 0.2]);
@@ -270,7 +316,7 @@ mod tests {
 
     #[test]
     fn drops_samples_from_before_the_recording() {
-        let mut track = Track::new(1.0);
+        let mut track = Track::new(Gain::new(1.0));
         let mut packet = vec![0.9; 2000 * CHANNELS]; // 2000 frames before the start...
         packet.extend([0.3, 0.3]); // ...and one frame right at it
         track.place(Some(-2000), &packet);
@@ -279,7 +325,7 @@ mod tests {
 
     #[test]
     fn slightly_late_packets_move_forward_and_gain_applies() {
-        let mut track = Track::new(0.5);
+        let mut track = Track::new(Gain::new(0.5));
         assert_eq!(mix(&mut track, 0, 2), vec![0.0; 4]); // nothing arrived yet
         track.place(Some(0), &[1.0; 8]); // 2 frames late: shifted, not lost
         assert_eq!(mix(&mut track, 2, 4), vec![0.5; 8]);
@@ -287,7 +333,7 @@ mod tests {
 
     #[test]
     fn very_late_packets_are_dropped() {
-        let mut track = Track::new(1.0);
+        let mut track = Track::new(Gain::new(1.0));
         mix(&mut track, 0, 2000);
         track.place(Some(0), &[1.0; 8]); // far older than what was already mixed
         assert_eq!(mix(&mut track, 2000, 2), vec![0.0; 4]);

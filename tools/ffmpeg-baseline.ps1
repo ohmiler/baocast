@@ -1,7 +1,7 @@
 <#
   Baseline for benchmarks: the leanest pipeline plain FFmpeg can do.
   Desktop Duplication capture (stays on the GPU) -> NVENC -> file.
-  No scenes, no preview, no overlays. Compare Baocast and OBS against this.
+  No scenes, no preview, no overlays. Compare MilerCast and OBS against this.
 
   Usage:
     powershell -ExecutionPolicy Bypass -File .\tools\ffmpeg-baseline.ps1
