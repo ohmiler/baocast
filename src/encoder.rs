@@ -35,6 +35,7 @@ pub struct Encoder {
     /// Set when the encoder expects us to allocate output buffers (of this size).
     output_buffer_size: Option<u32>,
     _manager: IMFDXGIDeviceManager,
+    codec: Option<ICodecAPI>,
     pub name: String,
     /// Settings this encoder refused, worth showing so users know what they're getting.
     pub ignored: Vec<&'static str>,
@@ -72,6 +73,9 @@ impl Encoder {
             let settings = [
                 ("CBR", CODECAPI_AVEncCommonRateControlMode, variant_u32(eAVEncCommonRateControlMode_CBR.0 as u32)),
                 ("bitrate", CODECAPI_AVEncCommonMeanBitRate, variant_u32(bitrate)),
+                // A one-second rate buffer keeps every second close to the target,
+                // so short bursts don't exceed what streaming sites accept.
+                ("rate buffer", CODECAPI_AVEncCommonBufferSize, variant_u32(bitrate)),
                 // A keyframe every 2 seconds, which Twitch and YouTube require.
                 ("keyframe interval", CODECAPI_AVEncMPVGOPSize, variant_u32(fps * 2)),
                 ("no B-frames", CODECAPI_AVEncMPVDefaultBPictureCount, variant_u32(0)),
@@ -106,7 +110,7 @@ impl Encoder {
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
             let events = transform.cast()?;
 
-            Ok(Self { transform, events, input_id, output_id, output_buffer_size, _manager: manager, name, ignored })
+            Ok(Self { transform, events, input_id, output_id, output_buffer_size, _manager: manager, codec, name, ignored })
         }
     }
 
@@ -175,6 +179,13 @@ impl Encoder {
             let data = std::slice::from_raw_parts(ptr, len as usize).to_vec();
             buffer.Unlock()?;
             Ok(Some(Packet { data, time, keyframe }))
+        }
+    }
+
+    /// Makes the next frame a keyframe, e.g. right after reconnecting to a server.
+    pub fn force_keyframe(&self) {
+        if let Some(codec) = &self.codec {
+            let _ = unsafe { codec.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &variant_u32(1)) };
         }
     }
 

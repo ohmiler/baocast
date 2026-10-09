@@ -1,31 +1,38 @@
-//! Minimal FLV writer. FLV tags are also what RTMP carries, so the same code
-//! will later feed Twitch/YouTube instead of a file.
+//! FLV tags: the container for recordings, and exactly what RTMP carries too,
+//! so one muxer feeds both the file and the live stream.
 
 use std::io::{self, Write};
 
-pub struct FlvWriter<W: Write> {
-    out: W,
+pub const AUDIO: u8 = 8;
+pub const VIDEO: u8 = 9;
+
+/// One FLV tag, ready to become a file record or an RTMP message.
+pub struct Tag<'a> {
+    pub kind: u8,
+    pub ms: u32,
+    pub body: &'a [u8],
+    /// A video keyframe: where a viewer can start decoding.
+    pub keyframe: bool,
+    /// Decoder config (AVC sequence header or AAC AudioSpecificConfig), needed before any frame.
+    pub config: bool,
+}
+
+pub trait Sink {
+    fn write(&mut self, tag: &Tag) -> io::Result<()>;
+    fn finish(&mut self) -> io::Result<()>;
+}
+
+/// Turns encoder output into FLV tags and hands each one to every sink.
+pub struct Muxer {
+    sinks: Vec<Box<dyn Sink>>,
     sps: Vec<u8>,
     pps: Vec<u8>,
     sent_config: bool,
 }
 
-impl<W: Write> FlvWriter<W> {
-    pub fn new(mut out: W, has_audio: bool) -> io::Result<Self> {
-        // "FLV", version 1, flags (4 = audio, 1 = video), header size 9, then PreviousTagSize0.
-        let flags = if has_audio { 0x05 } else { 0x01 };
-        out.write_all(&[b'F', b'L', b'V', 1, flags, 0, 0, 0, 9, 0, 0, 0, 0])?;
-        Ok(Self { out, sps: Vec::new(), pps: Vec::new(), sent_config: false })
-    }
-
-    /// The AAC decoder config (AudioSpecificConfig); must precede any audio frame.
-    pub fn write_audio_config(&mut self, config: &[u8]) -> io::Result<()> {
-        self.audio_tag(0, 0, config)
-    }
-
-    /// Writes one raw AAC frame.
-    pub fn write_audio(&mut self, frame: &[u8], ms: u32) -> io::Result<()> {
-        self.audio_tag(ms, 1, frame)
+impl Muxer {
+    pub fn new(sinks: Vec<Box<dyn Sink>>) -> Self {
+        Self { sinks, sps: Vec::new(), pps: Vec::new(), sent_config: false }
     }
 
     /// Remembers SPS/PPS given out of band (Annex-B), for encoders that don't repeat them in-stream.
@@ -39,8 +46,8 @@ impl<W: Write> FlvWriter<W> {
         }
     }
 
-    /// Writes one encoded H.264 frame (Annex-B) as an FLV video tag.
-    pub fn write_video(&mut self, annexb: &[u8], ms: u32, keyframe: bool) -> io::Result<()> {
+    /// Takes one encoded H.264 frame (Annex-B).
+    pub fn video(&mut self, annexb: &[u8], ms: u32, keyframe: bool) -> io::Result<()> {
         let mut keyframe = keyframe;
         let mut avcc = Vec::with_capacity(annexb.len() + 16);
         for nal in nal_units(annexb) {
@@ -60,19 +67,41 @@ impl<W: Write> FlvWriter<W> {
             if self.sps.is_empty() || self.pps.is_empty() || !keyframe {
                 return Ok(());
             }
-            let config = self.decoder_config();
-            self.video_tag(ms, true, 0, &config)?;
+            let config = video_body(true, 0, &self.decoder_config());
+            self.emit(&Tag { kind: VIDEO, ms, body: &config, keyframe: true, config: true })?;
             self.sent_config = true;
         }
         if avcc.is_empty() {
             return Ok(());
         }
-        self.video_tag(ms, keyframe, 1, &avcc)
+        let body = video_body(keyframe, 1, &avcc);
+        self.emit(&Tag { kind: VIDEO, ms, body: &body, keyframe, config: false })
     }
 
-    pub fn finish(mut self) -> io::Result<W> {
-        self.out.flush()?;
-        Ok(self.out)
+    /// The AAC decoder config (AudioSpecificConfig); must precede any audio frame.
+    pub fn audio_config(&mut self, config: &[u8]) -> io::Result<()> {
+        let body = audio_body(0, config);
+        self.emit(&Tag { kind: AUDIO, ms: 0, body: &body, keyframe: false, config: true })
+    }
+
+    /// Takes one raw AAC frame.
+    pub fn audio(&mut self, frame: &[u8], ms: u32) -> io::Result<()> {
+        let body = audio_body(1, frame);
+        self.emit(&Tag { kind: AUDIO, ms, body: &body, keyframe: false, config: false })
+    }
+
+    pub fn finish(&mut self) -> io::Result<()> {
+        for sink in &mut self.sinks {
+            sink.finish()?;
+        }
+        Ok(())
+    }
+
+    fn emit(&mut self, tag: &Tag) -> io::Result<()> {
+        for sink in &mut self.sinks {
+            sink.write(tag)?;
+        }
+        Ok(())
     }
 
     /// AVCDecoderConfigurationRecord (ISO 14496-15).
@@ -85,34 +114,54 @@ impl<W: Write> FlvWriter<W> {
         config.extend_from_slice(&self.pps);
         config
     }
+}
 
-    fn video_tag(&mut self, ms: u32, keyframe: bool, packet_type: u8, payload: &[u8]) -> io::Result<()> {
-        let frame_and_codec = if keyframe { 0x17 } else { 0x27 }; // frame type << 4 | 7 (AVC)
-        let mut body = Vec::with_capacity(payload.len() + 5);
-        // Composition time is 0 because we encode without B-frames.
-        body.extend_from_slice(&[frame_and_codec, packet_type, 0, 0, 0]);
-        body.extend_from_slice(payload);
-        self.tag(9, ms, &body)
+fn video_body(keyframe: bool, packet_type: u8, payload: &[u8]) -> Vec<u8> {
+    let frame_and_codec = if keyframe { 0x17 } else { 0x27 }; // frame type << 4 | 7 (AVC)
+    let mut body = Vec::with_capacity(payload.len() + 5);
+    // Composition time is 0 because we encode without B-frames.
+    body.extend_from_slice(&[frame_and_codec, packet_type, 0, 0, 0]);
+    body.extend_from_slice(payload);
+    body
+}
+
+fn audio_body(packet_type: u8, payload: &[u8]) -> Vec<u8> {
+    // 0xAF = AAC, 44 kHz flag (always set for AAC), 16-bit, stereo.
+    let mut body = Vec::with_capacity(payload.len() + 2);
+    body.extend_from_slice(&[0xAF, packet_type]);
+    body.extend_from_slice(payload);
+    body
+}
+
+/// Writes tags to an .flv file.
+pub struct FlvFile<W: Write> {
+    out: W,
+}
+
+impl<W: Write> FlvFile<W> {
+    pub fn new(mut out: W, has_audio: bool) -> io::Result<Self> {
+        // "FLV", version 1, flags (4 = audio, 1 = video), header size 9, then PreviousTagSize0.
+        let flags = if has_audio { 0x05 } else { 0x01 };
+        out.write_all(&[b'F', b'L', b'V', 1, flags, 0, 0, 0, 9, 0, 0, 0, 0])?;
+        Ok(Self { out })
     }
+}
 
-    fn audio_tag(&mut self, ms: u32, packet_type: u8, payload: &[u8]) -> io::Result<()> {
-        // 0xAF = AAC, 44 kHz flag (always set for AAC), 16-bit, stereo.
-        let mut body = Vec::with_capacity(payload.len() + 2);
-        body.extend_from_slice(&[0xAF, packet_type]);
-        body.extend_from_slice(payload);
-        self.tag(8, ms, &body)
-    }
-
-    fn tag(&mut self, kind: u8, ms: u32, body: &[u8]) -> io::Result<()> {
-        let size = body.len() as u32;
+impl<W: Write> Sink for FlvFile<W> {
+    fn write(&mut self, tag: &Tag) -> io::Result<()> {
+        let size = tag.body.len() as u32;
         let mut header = [0u8; 11];
-        header[0] = kind;
+        header[0] = tag.kind;
         header[1..4].copy_from_slice(&size.to_be_bytes()[1..]);
-        header[4..7].copy_from_slice(&ms.to_be_bytes()[1..]);
-        header[7] = (ms >> 24) as u8; // timestamp extension; stream ID stays 0
+        header[4..7].copy_from_slice(&tag.ms.to_be_bytes()[1..]);
+        header[7] = (tag.ms >> 24) as u8; // timestamp extension; stream ID stays 0
         self.out.write_all(&header)?;
-        self.out.write_all(body)?;
+        self.out.write_all(tag.body)?;
         self.out.write_all(&(size + 11).to_be_bytes())
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        self.out.flush()
     }
 }
 
@@ -149,6 +198,28 @@ fn trim_trailing_zeros(mut nal: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// (kind, ms, body, keyframe, config)
+    type Seen = Rc<RefCell<Vec<(u8, u32, Vec<u8>, bool, bool)>>>;
+
+    struct Collect(Seen);
+
+    impl Sink for Collect {
+        fn write(&mut self, tag: &Tag) -> io::Result<()> {
+            self.0.borrow_mut().push((tag.kind, tag.ms, tag.body.to_vec(), tag.keyframe, tag.config));
+            Ok(())
+        }
+        fn finish(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn muxer() -> (Muxer, Seen) {
+        let seen = Seen::default();
+        (Muxer::new(vec![Box::new(Collect(seen.clone()))]), seen)
+    }
 
     #[test]
     fn splits_three_and_four_byte_start_codes() {
@@ -157,41 +228,43 @@ mod tests {
     }
 
     #[test]
-    fn waits_for_keyframe_then_writes_config_and_frame() {
-        let mut flv = FlvWriter::new(Vec::new(), false).unwrap();
-        let header_len = 13;
-        // A P-frame before any keyframe is dropped.
-        flv.write_video(&[0, 0, 0, 1, 0x41, 9], 0, false).unwrap();
-        assert_eq!(flv.out.len(), header_len);
+    fn waits_for_keyframe_then_sends_config_and_frame() {
+        let (mut muxer, seen) = muxer();
+        muxer.video(&[0, 0, 0, 1, 0x41, 9], 0, false).unwrap(); // P-frame before any keyframe: dropped
+        assert!(seen.borrow().is_empty());
 
         let keyframe = [0, 0, 0, 1, 0x67, 0x64, 0, 0x28, 0, 0, 0, 1, 0x68, 0xEE, 0, 0, 0, 1, 0x65, 0xAA];
-        flv.write_video(&keyframe, 33, true).unwrap();
-        let out = flv.finish().unwrap();
-
-        // First tag: sequence header (AVCPacketType 0).
-        assert_eq!(out[header_len], 9);
-        assert_eq!(&out[header_len + 11..header_len + 13], &[0x17, 0]);
-        // Second tag: the IDR frame as a 4-byte length-prefixed NAL.
-        let config_len = u32::from_be_bytes([0, out[header_len + 1], out[header_len + 2], out[header_len + 3]]) as usize;
-        let second = header_len + 11 + config_len + 4;
-        assert_eq!(&out[second + 11..second + 13], &[0x17, 1]);
-        assert_eq!(&out[second + 16..second + 22], &[0, 0, 0, 2, 0x65, 0xAA]);
+        muxer.video(&keyframe, 33, true).unwrap();
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 2);
+        let (kind, _, config, _, is_config) = &seen[0];
+        assert_eq!((*kind, &config[..2], *is_config), (VIDEO, &[0x17, 0][..], true));
+        let (_, ms, frame, keyframe, is_config) = &seen[1];
+        assert_eq!((*ms, *keyframe, *is_config), (33, true, false));
+        assert_eq!(&frame[..], &[0x17, 1, 0, 0, 0, 0, 0, 0, 2, 0x65, 0xAA]);
     }
 
     #[test]
-    fn writes_audio_tags() {
-        let mut flv = FlvWriter::new(Vec::new(), true).unwrap();
-        flv.write_audio_config(&[0x11, 0x90]).unwrap();
-        flv.write_audio(&[1, 2, 3], 0x01_02_03_04).unwrap();
-        let out = flv.finish().unwrap();
+    fn audio_bodies() {
+        let (mut muxer, seen) = muxer();
+        muxer.audio_config(&[0x11, 0x90]).unwrap();
+        muxer.audio(&[1, 2, 3], 21).unwrap();
+        let seen = seen.borrow();
+        assert_eq!(seen[0].2, vec![0xAF, 0, 0x11, 0x90]);
+        assert!(seen[0].4);
+        assert_eq!((seen[1].1, &seen[1].2[..]), (21, &[0xAF, 1, 1, 2, 3][..]));
+    }
+
+    #[test]
+    fn file_tag_layout() {
+        let mut file = FlvFile::new(Vec::new(), true).unwrap();
+        file.write(&Tag { kind: AUDIO, ms: 0x01_02_03_04, body: &[7, 8], keyframe: false, config: false }).unwrap();
+        let out = file.out;
         assert_eq!(out[4], 0x05); // has audio and video
-
-        let first = 13;
-        assert_eq!(&out[first..first + 4], &[8, 0, 0, 4]); // audio tag, 4-byte body
-        assert_eq!(&out[first + 11..first + 15], &[0xAF, 0, 0x11, 0x90]);
-
-        let second = first + 11 + 4 + 4;
-        assert_eq!(&out[second + 4..second + 8], &[0x02, 0x03, 0x04, 0x01]); // ms with extension byte
-        assert_eq!(&out[second + 11..second + 16], &[0xAF, 1, 1, 2, 3]);
+        let tag = &out[13..];
+        assert_eq!(&tag[..4], &[8, 0, 0, 2]); // audio, 2-byte body
+        assert_eq!(&tag[4..8], &[0x02, 0x03, 0x04, 0x01]); // ms with extension byte
+        assert_eq!(&tag[11..13], &[7, 8]);
+        assert_eq!(&tag[13..17], &13u32.to_be_bytes()); // previous tag size
     }
 }

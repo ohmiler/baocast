@@ -4,7 +4,9 @@
 use windows::Graphics::Capture::{
     Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
 };
+use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
+use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
@@ -27,12 +29,25 @@ pub struct Capture {
     _item: GraphicsCaptureItem,
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
+    device: ID3D11Device,
+    winrt_device: IDirect3DDevice,
     context: ID3D11DeviceContext,
     /// Always holds the most recent frame.
     pub texture: ID3D11Texture2D,
     pub width: u32,
     pub height: u32,
 }
+
+pub enum Poll {
+    /// Nothing new since last time (the game didn't draw).
+    Unchanged,
+    /// `texture` holds a new frame.
+    NewFrame,
+    /// The window changed size: `texture`, `width` and `height` are new.
+    Resized,
+}
+
+const FORMAT: DirectXPixelFormat = DirectXPixelFormat::B8G8R8A8UIntNormalized;
 
 impl Capture {
     pub fn new(gpu: &Gpu, target: Target) -> Result<Self> {
@@ -44,12 +59,7 @@ impl Capture {
             }
         };
         let size = item.Size()?;
-        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-            &gpu.winrt_device,
-            DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            2,
-            size,
-        )?;
+        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&gpu.winrt_device, FORMAT, 2, size)?;
         let session = pool.CreateCaptureSession(&item)?;
         // Optional extras that older Windows builds lack, so failures are fine.
         let _ = session.SetIsCursorCaptureEnabled(false);
@@ -58,26 +68,53 @@ impl Capture {
         let (width, height) = (size.Width as u32, size.Height as u32);
         let texture = create_texture(&gpu.device, width, height)?;
         session.StartCapture()?;
-        Ok(Self { _item: item, pool, session, context: gpu.context.clone(), texture, width, height })
+        Ok(Self {
+            _item: item,
+            pool,
+            session,
+            device: gpu.device.clone(),
+            winrt_device: gpu.winrt_device.clone(),
+            context: gpu.context.clone(),
+            texture,
+            width,
+            height,
+        })
     }
 
-    /// Copies the newest frame into `texture`. Returns false when nothing new
-    /// arrived (the game didn't draw), so the caller can reuse the last frame.
-    pub fn poll(&self) -> Result<bool> {
+    /// Copies the newest frame into `texture`, if there is one.
+    pub fn poll(&mut self) -> Result<Poll> {
         let mut newest = None;
         while let Ok(frame) = self.pool.TryGetNextFrame() {
             if let Some(older) = newest.replace(frame) {
                 older.Close()?;
             }
         }
-        let Some(frame) = newest else { return Ok(false) };
+        let Some(frame) = newest else { return Ok(Poll::Unchanged) };
+        let size = frame.ContentSize()?;
+        if size.Width <= 0 || size.Height <= 0 {
+            // Minimised: keep showing the last frame.
+            frame.Close()?;
+            return Ok(Poll::Unchanged);
+        }
+        if (size.Width as u32, size.Height as u32) != (self.width, self.height) {
+            frame.Close()?;
+            self.resize(size)?;
+            return Ok(Poll::Resized);
+        }
         let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
         unsafe {
             let source: ID3D11Texture2D = access.GetInterface()?;
             self.context.CopyResource(&self.texture, &source);
         }
         frame.Close()?;
-        Ok(true)
+        Ok(Poll::NewFrame)
+    }
+
+    fn resize(&mut self, size: SizeInt32) -> Result<()> {
+        self.pool.Recreate(&self.winrt_device, FORMAT, 2, size)?;
+        (self.width, self.height) = (size.Width as u32, size.Height as u32);
+        self.texture = create_texture(&self.device, self.width, self.height)?;
+        Ok(())
     }
 }
 

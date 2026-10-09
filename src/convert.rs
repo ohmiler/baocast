@@ -3,6 +3,7 @@
 
 use std::mem::ManuallyDrop;
 
+use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709,
@@ -76,6 +77,17 @@ impl Converter {
             // No driver "enhancements" (sharpening, denoise...): we want a faithful copy.
             context.VideoProcessorSetStreamAutoProcessingMode(&processor, 0, false);
 
+            // Fit the picture inside the canvas, keeping its shape; black bars fill the rest.
+            let whole = |(w, h): (u32, u32)| RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 };
+            let placed = fit(from, to);
+            context.VideoProcessorSetStreamSourceRect(&processor, 0, true, Some(&whole(from)));
+            context.VideoProcessorSetStreamDestRect(&processor, 0, true, Some(&placed));
+            context.VideoProcessorSetOutputTargetRect(&processor, true, Some(&whole(to)));
+            let black = D3D11_VIDEO_COLOR {
+                Anonymous: D3D11_VIDEO_COLOR_0 { RGBA: D3D11_VIDEO_COLOR_RGBA { R: 0.0, G: 0.0, B: 0.0, A: 1.0 } },
+            };
+            context.VideoProcessorSetOutputBackgroundColor(&processor, false, &black);
+
             Ok(Self { context, processor, input: input.unwrap(), outputs, next: 0 })
         }
     }
@@ -98,6 +110,18 @@ impl Converter {
     }
 }
 
+/// The largest rectangle with the source's shape that fits the canvas, centred,
+/// with even coordinates (NV12 stores colour per 2x2 pixels).
+fn fit(source: (u32, u32), canvas: (u32, u32)) -> RECT {
+    let scale = (canvas.0 as f64 / source.0 as f64).min(canvas.1 as f64 / source.1 as f64);
+    let even = |v: f64, max: u32| ((v.round() as u32) & !1).clamp(2, max);
+    let width = even(source.0 as f64 * scale, canvas.0);
+    let height = even(source.1 as f64 * scale, canvas.1);
+    let left = ((canvas.0 - width) / 2) & !1;
+    let top = ((canvas.1 - height) / 2) & !1;
+    RECT { left: left as i32, top: top as i32, right: (left + width) as i32, bottom: (top + height) as i32 }
+}
+
 fn create_nv12(device: &ID3D11Device, width: u32, height: u32) -> Result<ID3D11Texture2D> {
     let desc = D3D11_TEXTURE2D_DESC {
         Width: width,
@@ -114,4 +138,29 @@ fn create_nv12(device: &ID3D11Device, width: u32, height: u32) -> Result<ID3D11T
     let mut texture = None;
     unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture))? };
     Ok(texture.unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(r: RECT) -> (i32, i32, i32, i32) {
+        (r.left, r.top, r.right, r.bottom)
+    }
+
+    #[test]
+    fn fills_canvas_when_shapes_match() {
+        assert_eq!(rect(fit((2560, 1440), (1920, 1080))), (0, 0, 1920, 1080));
+    }
+
+    #[test]
+    fn letterboxes_a_slightly_short_window() {
+        // A maximised window minus the taskbar: thin black bars top and bottom.
+        assert_eq!(rect(fit((2560, 1392), (1920, 1080))), (0, 18, 1920, 1062));
+    }
+
+    #[test]
+    fn pillarboxes_a_portrait_monitor() {
+        assert_eq!(rect(fit((1080, 1920), (1920, 1080))), (656, 0, 1264, 1080));
+    }
 }
