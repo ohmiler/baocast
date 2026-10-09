@@ -9,7 +9,6 @@ pub struct Config {
     /// "youtube", "twitch" or "custom".
     pub destination: String,
     pub custom_server: String,
-    pub remember_key: bool,
     pub quality: usize,
     pub desktop_on: bool,
     pub desktop_volume: u32,
@@ -34,7 +33,6 @@ impl Default for Config {
             capture: "auto".into(),
             destination: "youtube".into(),
             custom_server: String::new(),
-            remember_key: true,
             quality: 0,
             desktop_on: true,
             desktop_volume: 100,
@@ -68,7 +66,6 @@ impl Config {
                 "capture" => config.capture = value,
                 "destination" => config.destination = value,
                 "custom_server" => config.custom_server = value,
-                "remember_key" => config.remember_key = flag,
                 "quality" => config.quality = number.unwrap_or(0) as usize,
                 "desktop_on" => config.desktop_on = flag,
                 "desktop_volume" => config.desktop_volume = number.unwrap_or(100).min(200),
@@ -91,13 +88,12 @@ impl Config {
         let Some(path) = path() else { return };
         let flag = |on: bool| if on { "1" } else { "0" };
         let text = format!(
-            "capture={}\ndestination={}\ncustom_server={}\nremember_key={}\nquality={}\n\
+            "capture={}\ndestination={}\ncustom_server={}\nquality={}\n\
              desktop_on={}\ndesktop_volume={}\nmic_on={}\nmic_volume={}\nmic_name={}\n\
              camera_on={}\ncamera_name={}\ncamera_corner={}\ncamera_size={}\ncamera_mirror={}\nsave_copy={}\n",
             self.capture,
             self.destination,
             self.custom_server,
-            flag(self.remember_key),
             self.quality,
             flag(self.desktop_on),
             self.desktop_volume,

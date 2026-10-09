@@ -1,33 +1,44 @@
-//! The MilerCast window. Plain Win32 controls: no GPU, no web engine, and only
-//! what changes gets redrawn. The engine runs on its own thread, so the window
-//! can't slow the stream down (or the other way round).
+//! The MilerCast window: Home (game, destination, sound, camera, go live), a
+//! small Live panel while streaming, and a separate Settings window for things
+//! set once. Plain Win32 controls: no GPU, no web engine, and nothing is drawn
+//! or measured while the window is minimised or behind the game.
 
 mod config;
+mod home;
+mod key_dialog;
+mod live;
 mod secret;
+mod settings;
 mod text;
+mod tray;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    COLOR_GRAYTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, CreateFontIndirectW, CreateSolidBrush, FW_SEMIBOLD, FillRect,
-    GetSysColor, GetSysColorBrush, HBRUSH, HDC, HFONT, InvalidateRect, SetBkMode, SetTextColor, TRANSPARENT,
+    COLOR_GRAYTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, CreateFontIndirectW, CreatePen, CreateSolidBrush, DT_CENTER,
+    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FW_SEMIBOLD, FillRect, GetSysColor, GetSysColorBrush,
+    HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect, PS_NULL, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow, RoundRect, SelectObject, SetBkMode, SetTextColor,
+    TRANSPARENT,
 };
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Controls::{
-    DRAWITEMSTRUCT, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx,
+    DRAWITEMSTRUCT, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, ODS_DISABLED,
+    ODS_SELECTED,
 };
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_SYSTEM_AWARE, GetDpiForWindow, SetProcessDpiAwarenessContext,
     SystemParametersInfoForDpi,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
-use windows::Win32::UI::Shell::{FOLDERID_Videos, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey,
+};
+use windows::Win32::UI::Shell::{FOLDERID_Videos, KF_FLAG_DEFAULT, SHGetKnownFolderPath, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -35,7 +46,6 @@ use milercast::audio::{self, Gain};
 use milercast::camera::{self, Overlay};
 use milercast::capture;
 use milercast::engine::{CameraChoice, Engine, Mic, Phase, Settings, Video};
-use milercast::rtmp::{self, Status};
 
 use config::Config;
 use text::Text;
@@ -58,6 +68,7 @@ const TBM_SETPOS: u32 = 0x0405;
 const TBM_SETRANGE: u32 = 0x0406;
 const BS_AUTOCHECKBOX: u32 = 0x3;
 const BS_AUTORADIOBUTTON: u32 = 0x9;
+const BS_OWNERDRAW: u32 = 0xB;
 const BS_PUSHLIKE: u32 = 0x1000;
 const ES_PASSWORD: u32 = 0x20;
 const ES_AUTOHSCROLL: u32 = 0x80;
@@ -69,38 +80,22 @@ const TABSTOP: u32 = 0x0001_0000;
 const GROUP: u32 = 0x0002_0000;
 const VSCROLL: u32 = 0x0020_0000;
 const CLIENTEDGE: u32 = 0x200;
-
-// Control IDs.
-const ID_CAPTURE: u16 = 100;
-const ID_YOUTUBE: u16 = 101;
-const ID_TWITCH: u16 = 102;
-const ID_CUSTOM: u16 = 103;
-const ID_SHOW_KEY: u16 = 104;
-const ID_REMEMBER: u16 = 105;
-const ID_DESKTOP_ON: u16 = 106;
-const ID_MIC_ON: u16 = 107;
-const ID_MIC: u16 = 108;
-const ID_QUALITY: u16 = 109;
-const ID_SAVE_COPY: u16 = 110;
-const ID_GO_LIVE: u16 = 111;
-const ID_RECORD: u16 = 112;
-const ID_SERVER: u16 = 113;
-const ID_KEY: u16 = 114;
-const ID_CAMERA_ON: u16 = 115;
-const ID_CAMERA: u16 = 116;
-const ID_CORNER: u16 = 117;
-const ID_SIZE: u16 = 118;
-const ID_MIRROR: u16 = 119;
-const ID_OTHER: u16 = 199;
+const BLACK_DOT: usize = 0x25CF;
+const WM_TRAY: u32 = WM_APP + 1;
 
 const TIMER: usize = 1;
-const CLIENT: (i32, i32) = (420, 642);
+const WIDTH: i32 = 420;
 
 /// (height, fps, kbps, note: 0 none, 1 recommended, 2 YouTube, 3 slow internet)
 const PRESETS: [(u32, u32, u32, u8); 5] =
     [(1080, 60, 6000, 1), (1080, 60, 9000, 2), (1080, 30, 4500, 0), (720, 60, 4500, 0), (720, 30, 3000, 3)];
 
-const BLACK_DOT: usize = 0x25CF;
+/// Stream destinations: config name, label, where to find the key.
+const DESTINATIONS: [(&str, &str, &str); 3] = [
+    ("youtube", "YouTube", "https://www.youtube.com/live_dashboard"),
+    ("twitch", "Twitch", "https://dashboard.twitch.tv/settings/stream"),
+    ("custom", "", ""),
+];
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -113,41 +108,55 @@ thread_local! {
 struct Paint {
     meters: [HWND; 2],
     levels: [f32; 2],
-    muted_text: Vec<HWND>,
-    status: HWND,
-    status_color: Option<COLORREF>,
-    brushes: Option<[HBRUSH; 4]>, // track, green, amber, red
+    muted: Vec<HWND>,
+    colors: Vec<(HWND, COLORREF)>,
+    /// The big red button(s).
+    accent: Vec<HWND>,
+    accent_font: Option<HFONT>,
+    corner_buttons: [HWND; 4],
+    corner: u8,
+    brushes: Option<Brushes>,
 }
 
-#[derive(Default)]
-struct Controls {
-    capture: HWND,
-    capture_hint: HWND,
-    youtube: HWND,
-    twitch: HWND,
-    custom: HWND,
-    server: HWND,
-    key: HWND,
-    show_key: HWND,
-    remember: HWND,
-    desktop_on: HWND,
-    desktop_volume: HWND,
-    desktop_pct: HWND,
-    mic_on: HWND,
-    mic_volume: HWND,
-    mic_pct: HWND,
-    mic: HWND,
-    camera_on: HWND,
-    camera: HWND,
-    corner: HWND,
-    size: HWND,
-    mirror: HWND,
-    quality: HWND,
-    save_copy: HWND,
-    go_live: HWND,
-    record: HWND,
-    status: HWND,
-    stats: HWND,
+#[derive(Clone, Copy)]
+struct Brushes {
+    track: HBRUSH,
+    green: HBRUSH,
+    amber: HBRUSH,
+    red: HBRUSH,
+    red_dark: HBRUSH,
+    grey: HBRUSH,
+    accent_soft: HBRUSH,
+    outline: HBRUSH,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tone {
+    Plain,
+    Muted,
+    Good,
+    Warn,
+    Bad,
+    Live,
+}
+
+impl Tone {
+    fn color(self) -> Option<COLORREF> {
+        match self {
+            Tone::Plain => None,
+            Tone::Muted => Some(COLORREF(unsafe { GetSysColor(COLOR_GRAYTEXT) })),
+            Tone::Good => Some(rgb(16, 124, 65)),
+            Tone::Warn => Some(rgb(176, 108, 0)),
+            Tone::Bad => Some(rgb(196, 43, 28)),
+            Tone::Live => Some(rgb(200, 30, 45)),
+        }
+    }
+}
+
+struct Fonts {
+    normal: HFONT,
+    bold: HFONT,
+    big: HFONT,
 }
 
 enum Choice {
@@ -178,29 +187,34 @@ struct App {
     hwnd: HWND,
     text: &'static Text,
     dpi: i32,
-    font: HFONT,
-    bold: HFONT,
-    c: Controls,
+    fonts: Fonts,
     config: Config,
+    home: home::Home,
+    live: live::Live,
+    settings: Option<settings::SettingsWindow>,
+    key: Option<key_dialog::KeyDialog>,
     choices: Vec<Choice>,
-    /// Microphone names in the list; "" is the Windows default.
+    /// Microphone names; "" is the Windows default.
     mics: Vec<String>,
+    cameras: Vec<String>,
     desktop_gain: Gain,
     mic_gain: Gain,
-    /// Camera placement, shared with the engine so it can change while live.
     overlay: Arc<Overlay>,
-    cameras: Vec<String>,
-    /// Whether the running engine was started with the camera.
-    camera_opened: bool,
-    /// Audio opened only for the level meters while not live.
+    /// Audio opened only for the level meters, while Home is in front.
     preview: Vec<(usize, audio::Source)>,
+    preview_on: bool,
     levels: [f32; 2],
     engine: Option<Engine>,
     mode: Mode,
-    live: bool,
-    showing_key: bool,
+    /// Streaming (true) or only recording (false).
+    live_mode: bool,
+    camera_opened: bool,
+    warned: bool,
     record_path: Option<PathBuf>,
-    ticks: u32,
+    minimized: bool,
+    interval: u32,
+    last_status: Instant,
+    last_hint: Instant,
     upload: (u64, Instant, f64),
     drops: (u64, Instant),
 }
@@ -215,27 +229,27 @@ pub fn run() {
             dwICC: ICC_STANDARD_CLASSES | ICC_BAR_CLASSES,
         });
         let instance = GetModuleHandleW(None).unwrap_or_default();
-        let class = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(wndproc),
-            hInstance: instance.into(),
-            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
-            hbrBackground: GetSysColorBrush(COLOR_WINDOW),
-            lpszClassName: w!("MilerCast"),
-            ..Default::default()
-        };
-        RegisterClassExW(&class);
-        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+        for class in [w!("MilerCast"), w!("MilerCastPanel")] {
+            RegisterClassExW(&WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(wndproc),
+                hInstance: instance.into(),
+                hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+                hbrBackground: GetSysColorBrush(COLOR_WINDOW),
+                lpszClassName: class,
+                ..Default::default()
+            });
+        }
         let Ok(hwnd) = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             w!("MilerCast"),
             w!("MilerCast"),
-            style,
+            MAIN_STYLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            CLIENT.0,
-            CLIENT.1,
+            WIDTH,
+            400,
             None,
             None,
             Some(instance.into()),
@@ -244,28 +258,17 @@ pub fn run() {
             return;
         };
         let dpi = GetDpiForWindow(hwnd) as i32;
-        let mut frame = RECT { left: 0, top: 0, right: CLIENT.0 * dpi / 96, bottom: CLIENT.1 * dpi / 96 };
-        let _ = AdjustWindowRectExForDpi(&mut frame, style, false, WINDOW_EX_STYLE(0), dpi as u32);
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            0,
-            0,
-            frame.right - frame.left,
-            frame.bottom - frame.top,
-            SWP_NOMOVE | SWP_NOZORDER,
-        );
-
         let app = App::new(hwnd, dpi);
         APP.with(|cell| *cell.borrow_mut() = Some(app));
         APP.with(|cell| cell.borrow_mut().as_mut().unwrap().init());
         let _ = ShowWindow(hwnd, SW_SHOW);
-        SetTimer(Some(hwnd), TIMER, 50, None);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            if IsDialogMessageW(hwnd, &msg).as_bool() {
-                continue; // Tab moves between controls
+            // Tab moves between controls in whichever of our windows has focus.
+            let root = GetAncestor(msg.hwnd, GA_ROOT);
+            if !root.0.is_null() && IsDialogMessageW(root, &msg).as_bool() {
+                continue;
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -275,17 +278,22 @@ pub fn run() {
     }
 }
 
+// WS_CLIPCHILDREN: the window's own background never paints over its controls.
+const MAIN_STYLE: WINDOW_STYLE =
+    WINDOW_STYLE(WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_CLIPCHILDREN.0);
+const PANEL_STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_POPUP.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_CLIPCHILDREN.0);
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let painted = match msg {
         WM_CTLCOLORSTATIC => PAINT.with(|p| p.borrow().color_static(wparam, lparam)),
-        WM_DRAWITEM => PAINT.with(|p| p.borrow().draw_meter(lparam)),
+        WM_DRAWITEM => PAINT.with(|p| p.borrow().draw_item(lparam)),
         _ => None,
     };
     if let Some(result) = painted {
         return result;
     }
     let handled = APP.with(|cell| match cell.try_borrow_mut() {
-        Ok(mut app) => app.as_mut().and_then(|app| app.handle(msg, wparam)),
+        Ok(mut app) => app.as_mut().and_then(|app| app.handle(hwnd, msg, wparam, lparam)),
         // Re-entered, e.g. while a message box is open: let Windows handle it.
         Err(_) => None,
     });
@@ -298,37 +306,111 @@ impl Paint {
         let control = HWND(lparam.0 as *mut _);
         unsafe {
             SetBkMode(hdc, TRANSPARENT);
-            let color = if control == self.status {
-                self.status_color.unwrap_or(COLORREF(GetSysColor(COLOR_WINDOWTEXT)))
-            } else if self.muted_text.contains(&control) {
-                COLORREF(GetSysColor(COLOR_GRAYTEXT))
-            } else {
-                COLORREF(GetSysColor(COLOR_WINDOWTEXT))
+            let color = match self.colors.iter().find(|(hwnd, _)| *hwnd == control) {
+                Some((_, color)) => *color,
+                None if self.muted.contains(&control) => COLORREF(GetSysColor(COLOR_GRAYTEXT)),
+                None => COLORREF(GetSysColor(COLOR_WINDOWTEXT)),
             };
             SetTextColor(hdc, color);
             Some(LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize))
         }
     }
 
-    fn draw_meter(&self, lparam: LPARAM) -> Option<LRESULT> {
+    fn draw_item(&self, lparam: LPARAM) -> Option<LRESULT> {
         let item = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
-        let index = self.meters.iter().position(|&m| m == item.hwndItem)?;
-        let [track, green, amber, red] = self.brushes?;
+        let b = self.brushes?;
+        if let Some(index) = self.meters.iter().position(|&m| m == item.hwndItem) {
+            self.draw_meter(item, index, b);
+        } else if let Some(corner) = self.corner_buttons.iter().position(|&c| c == item.hwndItem) {
+            self.draw_corner(item, corner as u8, b);
+        } else if self.accent.contains(&item.hwndItem) {
+            self.draw_accent(item, b);
+        } else {
+            return None;
+        }
+        Some(LRESULT(1))
+    }
+
+    fn draw_meter(&self, item: &DRAWITEMSTRUCT, index: usize, b: Brushes) {
         let level = self.levels[index];
         let rect = item.rcItem;
         let filled = RECT { right: rect.left + ((rect.right - rect.left) as f32 * level) as i32, ..rect };
         let brush = if level > 0.95 {
-            red
+            b.red
         } else if level > 0.8 {
-            amber
+            b.amber
         } else {
-            green
+            b.green
         };
         unsafe {
-            FillRect(item.hDC, &rect, track);
+            FillRect(item.hDC, &rect, b.track);
             FillRect(item.hDC, &filled, brush);
         }
-        Some(LRESULT(1))
+    }
+
+    /// A little screen with the chosen corner filled in.
+    fn draw_corner(&self, item: &DRAWITEMSTRUCT, corner: u8, b: Brushes) {
+        let r = item.rcItem;
+        let chosen = corner == self.corner;
+        unsafe {
+            FillRect(item.hDC, &r, if chosen { b.accent_soft } else { GetSysColorBrush(COLOR_WINDOW) });
+            let (w, h) = (r.right - r.left, r.bottom - r.top);
+            let screen = RECT { left: r.left + w / 5, top: r.top + h / 4, right: r.right - w / 5, bottom: r.bottom - h / 4 };
+            frame(item.hDC, screen, if chosen { b.red_dark } else { b.outline });
+            let (sw, sh) = (screen.right - screen.left, screen.bottom - screen.top);
+            let (cw, ch) = (sw * 2 / 5, sh * 2 / 5);
+            let left = if corner % 2 == 0 { screen.left + 2 } else { screen.right - cw - 2 };
+            let top = if corner < 2 { screen.top + 2 } else { screen.bottom - ch - 2 };
+            let cam = RECT { left, top, right: left + cw, bottom: top + ch };
+            FillRect(item.hDC, &cam, if chosen { b.red } else { b.grey });
+        }
+    }
+
+    fn draw_accent(&self, item: &DRAWITEMSTRUCT, b: Brushes) {
+        let r = item.rcItem;
+        let pressed = item.itemState.0 & ODS_SELECTED.0 != 0;
+        let disabled = item.itemState.0 & ODS_DISABLED.0 != 0;
+        let fill = if disabled {
+            b.grey
+        } else if pressed {
+            b.red_dark
+        } else {
+            b.red
+        };
+        unsafe {
+            let pen = CreatePen(PS_NULL, 0, COLORREF(0));
+            let old_pen = SelectObject(item.hDC, HGDIOBJ(pen.0));
+            let old_brush = SelectObject(item.hDC, HGDIOBJ(fill.0));
+            let radius = (r.bottom - r.top) / 4;
+            let _ = RoundRect(item.hDC, r.left, r.top, r.right, r.bottom, radius, radius);
+            SelectObject(item.hDC, old_brush);
+            SelectObject(item.hDC, old_pen);
+            let _ = DeleteObject(HGDIOBJ(pen.0));
+            let mut label = [0u16; 64];
+            let len = GetWindowTextW(item.hwndItem, &mut label);
+            SetBkMode(item.hDC, TRANSPARENT);
+            SetTextColor(item.hDC, rgb(255, 255, 255));
+            let old_font = self.accent_font.map(|f| SelectObject(item.hDC, HGDIOBJ(f.0)));
+            let mut text_rect = r;
+            DrawTextW(item.hDC, &mut label[..len.max(0) as usize], &mut text_rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            if let Some(old) = old_font {
+                SelectObject(item.hDC, old);
+            }
+        }
+    }
+}
+
+/// A one-pixel outline.
+unsafe fn frame(hdc: HDC, r: RECT, brush: HBRUSH) {
+    unsafe {
+        for edge in [
+            RECT { bottom: r.top + 1, ..r },
+            RECT { top: r.bottom - 1, ..r },
+            RECT { right: r.left + 1, ..r },
+            RECT { left: r.right - 1, ..r },
+        ] {
+            FillRect(hdc, &edge, brush);
+        }
     }
 }
 
@@ -348,44 +430,110 @@ fn word(value: usize) -> u32 {
 impl App {
     fn new(hwnd: HWND, dpi: i32) -> Self {
         let text = text::current();
-        let (font, bold) = fonts(dpi, text.thai);
         let config = Config::load();
         let overlay = Overlay::new(false, config.camera_corner, config.camera_size, config.camera_mirror);
         let mut app = App {
             hwnd,
             text,
             dpi,
-            font,
-            bold,
-            c: Controls::default(),
+            fonts: fonts(dpi, text.thai),
+            home: home::Home::default(),
+            live: live::Live::default(),
+            settings: None,
+            key: None,
+            choices: Vec::new(),
+            mics: Vec::new(),
+            cameras: Vec::new(),
             desktop_gain: Gain::new(0.0),
             mic_gain: Gain::new(0.0),
             overlay,
-            cameras: Vec::new(),
-            camera_opened: false,
             config,
-            choices: Vec::new(),
-            mics: Vec::new(),
             preview: Vec::new(),
+            preview_on: false,
             levels: [0.0; 2],
             engine: None,
             mode: Mode::Idle,
-            live: false,
-            showing_key: false,
+            live_mode: false,
+            camera_opened: false,
+            warned: false,
             record_path: None,
-            ticks: 0,
+            minimized: false,
+            interval: 0,
+            last_status: Instant::now(),
+            last_hint: Instant::now(),
             upload: (0, Instant::now(), 0.0),
             drops: (0, Instant::now()),
         };
-        app.build();
+        app.home = app.build_home();
+        app.live = app.build_live();
+        PAINT.with(|p| {
+            let mut p = p.borrow_mut();
+            p.accent_font = Some(app.fonts.big);
+            p.brushes = Some(unsafe {
+                Brushes {
+                    track: CreateSolidBrush(rgb(228, 228, 228)),
+                    green: CreateSolidBrush(rgb(38, 166, 91)),
+                    amber: CreateSolidBrush(rgb(230, 162, 60)),
+                    red: CreateSolidBrush(rgb(214, 48, 49)),
+                    red_dark: CreateSolidBrush(rgb(170, 30, 35)),
+                    grey: CreateSolidBrush(rgb(180, 180, 180)),
+                    accent_soft: CreateSolidBrush(rgb(252, 228, 228)),
+                    outline: CreateSolidBrush(rgb(150, 150, 150)),
+                }
+            });
+        });
         app
+    }
+
+    fn init(&mut self) {
+        self.mics = std::iter::once(String::new())
+            .chain(audio::microphones().unwrap_or_default().into_iter().map(|d| d.name))
+            .collect();
+        if !self.mics.contains(&self.config.mic_name) {
+            self.config.mic_name.clear();
+        }
+        self.cameras = camera::cameras();
+        if !self.cameras.contains(&self.config.camera_name) {
+            // The first real camera: virtual ones re-send another app's picture.
+            self.config.camera_name = self
+                .cameras
+                .iter()
+                .find(|c| !c.to_lowercase().contains("virtual"))
+                .or(self.cameras.first())
+                .cloned()
+                .unwrap_or_default();
+        }
+        if self.cameras.is_empty() {
+            self.config.camera_on = false;
+        }
+        self.init_home();
+        self.apply_gains();
+        self.show_page(false);
+        tray::add(self.hwnd, "MilerCast");
+        self.check_activity();
+    }
+
+    /// Hotkeys exist only while streaming or recording: a system-wide shortcut
+    /// should never change anything (like switching the camera on) while idle.
+    fn hotkeys(&self, on: bool) {
+        for (id, key) in [(1, 'M'), (2, 'G'), (3, 'C')] {
+            unsafe {
+                if on {
+                    let _ = RegisterHotKey(Some(self.hwnd), id, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, key as u32);
+                } else {
+                    let _ = UnregisterHotKey(Some(self.hwnd), id);
+                }
+            }
+        }
     }
 
     fn s(&self, v: i32) -> i32 {
         v * self.dpi / 96
     }
 
-    fn add(&self, class: PCWSTR, label: &str, style: u32, ex: u32, (x, y, w, h): (i32, i32, i32, i32), id: u16) -> HWND {
+    /// A child control on `parent`, in 96-dpi units.
+    fn add(&self, parent: HWND, class: PCWSTR, label: &str, style: u32, ex: u32, rect: (i32, i32, i32, i32), id: u16) -> HWND {
+        let (x, y, w, h) = rect;
         unsafe {
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE(ex),
@@ -396,168 +544,137 @@ impl App {
                 self.s(y),
                 self.s(w),
                 self.s(h),
-                Some(self.hwnd),
+                Some(parent),
                 Some(HMENU(id as usize as *mut _)),
                 None,
                 None,
             )
             .unwrap_or_default();
-            SendMessageW(hwnd, WM_SETFONT, Some(WPARAM(self.font.0 as usize)), Some(LPARAM(1)));
+            set_font(hwnd, self.fonts.normal);
             hwnd
         }
     }
 
-    fn heading(&self, label: &str, y: i32) {
-        let hwnd = self.add(w!("STATIC"), label, 0, 0, (16, y, 388, 20), ID_OTHER);
-        unsafe { SendMessageW(hwnd, WM_SETFONT, Some(WPARAM(self.bold.0 as usize)), Some(LPARAM(1))) };
+    fn label(&self, parent: HWND, label: &str, rect: (i32, i32, i32, i32)) -> HWND {
+        self.add(parent, w!("STATIC"), label, SS_ENDELLIPSIS, 0, rect, 0)
     }
 
-    fn label(&self, label: &str, rect: (i32, i32, i32, i32)) -> HWND {
-        self.add(w!("STATIC"), label, SS_ENDELLIPSIS, 0, rect, ID_OTHER)
+    fn heading(&self, parent: HWND, label: &str, rect: (i32, i32, i32, i32)) -> HWND {
+        let hwnd = self.label(parent, label, rect);
+        set_font(hwnd, self.fonts.bold);
+        hwnd
     }
 
-    fn build(&mut self) {
-        let t = self.text;
-        let button = w!("BUTTON");
-        let combo = w!("COMBOBOX");
-        let edit = w!("EDIT");
-        let slider = w!("msctls_trackbar32");
-
-        self.heading(t.capture, 14);
-        self.c.capture = self.add(combo, "", CBS_DROPDOWNLIST | VSCROLL | TABSTOP, 0, (16, 36, 388, 320), ID_CAPTURE);
-        self.c.capture_hint = self.label("", (16, 63, 388, 18));
-
-        self.heading(t.stream_to, 92);
-        let radio = BS_AUTORADIOBUTTON | BS_PUSHLIKE | TABSTOP;
-        self.c.youtube = self.add(button, "YouTube", radio | GROUP, 0, (16, 114, 124, 28), ID_YOUTUBE);
-        self.c.twitch = self.add(button, "Twitch", radio, 0, (148, 114, 124, 28), ID_TWITCH);
-        self.c.custom = self.add(button, t.custom, radio, 0, (280, 114, 124, 28), ID_CUSTOM);
-        self.label(t.server, (16, 155, 84, 20));
-        self.c.server = self.add(edit, "", ES_AUTOHSCROLL | TABSTOP | GROUP, CLIENTEDGE, (104, 151, 300, 24), ID_SERVER);
-        self.label(t.stream_key, (16, 185, 84, 20));
-        self.c.key = self.add(edit, "", ES_AUTOHSCROLL | ES_PASSWORD | TABSTOP, CLIENTEDGE, (104, 181, 232, 24), ID_KEY);
-        self.c.show_key = self.add(button, t.show, TABSTOP, 0, (342, 180, 62, 26), ID_SHOW_KEY);
-        self.c.remember = self.add(button, t.remember_key, BS_AUTOCHECKBOX | TABSTOP, 0, (104, 210, 300, 20), ID_REMEMBER);
-
-        self.heading(t.audio, 242);
-        self.c.desktop_on = self.add(button, t.desktop, BS_AUTOCHECKBOX | TABSTOP, 0, (16, 264, 236, 22), ID_DESKTOP_ON);
-        self.c.desktop_volume = self.add(slider, "", TBS_NOTICKS | TABSTOP, 0, (256, 263, 108, 26), ID_OTHER);
-        self.c.desktop_pct = self.label("", (368, 266, 40, 20));
-        let desktop_meter = self.add(w!("STATIC"), "", SS_OWNERDRAW, 0, (16, 291, 388, 6), ID_OTHER);
-        self.c.mic_on = self.add(button, t.microphone, BS_AUTOCHECKBOX | TABSTOP, 0, (16, 306, 236, 22), ID_MIC_ON);
-        self.c.mic_volume = self.add(slider, "", TBS_NOTICKS | TABSTOP, 0, (256, 305, 108, 26), ID_OTHER);
-        self.c.mic_pct = self.label("", (368, 308, 40, 20));
-        self.c.mic = self.add(combo, "", CBS_DROPDOWNLIST | VSCROLL | TABSTOP, 0, (16, 332, 388, 240), ID_MIC);
-        let mic_meter = self.add(w!("STATIC"), "", SS_OWNERDRAW, 0, (16, 362, 388, 6), ID_OTHER);
-
-        self.heading(t.camera, 380);
-        self.c.camera_on = self.add(button, t.show_camera, BS_AUTOCHECKBOX | TABSTOP, 0, (16, 403, 130, 22), ID_CAMERA_ON);
-        self.c.camera = self.add(combo, "", CBS_DROPDOWNLIST | VSCROLL | TABSTOP, 0, (150, 402, 254, 200), ID_CAMERA);
-        self.c.corner = self.add(combo, "", CBS_DROPDOWNLIST | TABSTOP, 0, (16, 434, 150, 200), ID_CORNER);
-        self.c.size = self.add(combo, "", CBS_DROPDOWNLIST | TABSTOP, 0, (174, 434, 110, 200), ID_SIZE);
-        self.c.mirror = self.add(button, t.mirror, BS_AUTOCHECKBOX | TABSTOP, 0, (294, 436, 110, 22), ID_MIRROR);
-
-        self.heading(t.quality, 466);
-        self.c.quality = self.add(combo, "", CBS_DROPDOWNLIST | TABSTOP, 0, (16, 488, 388, 200), ID_QUALITY);
-        self.c.save_copy = self.add(button, t.save_copy, BS_AUTOCHECKBOX | TABSTOP, 0, (16, 520, 388, 20), ID_SAVE_COPY);
-
-        self.c.go_live = self.add(button, t.go_live, TABSTOP, 0, (16, 552, 250, 38), ID_GO_LIVE);
-        self.c.record = self.add(button, t.record, TABSTOP, 0, (274, 552, 130, 38), ID_RECORD);
-        self.c.status = self.label(t.ready, (16, 600, 388, 20));
-        unsafe { SendMessageW(self.c.status, WM_SETFONT, Some(WPARAM(self.bold.0 as usize)), Some(LPARAM(1))) };
-        self.c.stats = self.label("", (16, 620, 388, 18));
-
-        PAINT.with(|p| {
-            let mut p = p.borrow_mut();
-            p.meters = [desktop_meter, mic_meter];
-            p.muted_text = vec![self.c.capture_hint, self.c.stats, self.c.desktop_pct, self.c.mic_pct];
-            p.status = self.c.status;
-            p.brushes = Some(unsafe {
-                [
-                    CreateSolidBrush(rgb(228, 228, 228)),
-                    CreateSolidBrush(rgb(38, 166, 91)),
-                    CreateSolidBrush(rgb(230, 162, 60)),
-                    CreateSolidBrush(rgb(220, 53, 69)),
-                ]
-            });
-        });
-    }
-
-    /// Fills the controls from the saved settings.
-    fn init(&mut self) {
-        let t = self.text;
+    /// Resizes `window` so its client area is `height` (96-dpi units) tall.
+    fn fit_window(&self, window: HWND, height: i32, style: WINDOW_STYLE) {
+        let mut frame = RECT { left: 0, top: 0, right: self.s(WIDTH), bottom: self.s(height) };
         unsafe {
-            SendMessageW(self.c.capture, CB_SETDROPPEDWIDTH, Some(WPARAM(self.s(520) as usize)), None);
-            for (slider, volume) in [(self.c.desktop_volume, self.config.desktop_volume), (self.c.mic_volume, self.config.mic_volume)] {
-                SendMessageW(slider, TBM_SETRANGE, Some(WPARAM(1)), Some(LPARAM((200 << 16) as isize)));
-                SendMessageW(slider, TBM_SETPOS, Some(WPARAM(1)), Some(LPARAM(volume as isize)));
-            }
-            set_cue(self.c.key, t.key_placeholder);
-            set_cue(self.c.server, "rtmp://");
+            let _ = AdjustWindowRectExForDpi(&mut frame, style, false, WINDOW_EX_STYLE(0), self.dpi as u32);
+            let _ = SetWindowPos(
+                window,
+                None,
+                0,
+                0,
+                frame.right - frame.left,
+                frame.bottom - frame.top,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
-        self.fill_captures();
-        self.fill_mics();
-        for (index, &(height, fps, kbps, note)) in PRESETS.iter().enumerate() {
-            let note = match note {
-                1 => format!(" ({})", t.recommended),
-                2 => " (YouTube)".to_string(),
-                3 => format!(" ({})", t.slow_internet),
-                _ => String::new(),
-            };
-            add_item(self.c.quality, &format!("{height}p {fps} fps · {} Mbps{note}", kbps as f32 / 1000.0));
-            if index == self.config.quality {
-                select(self.c.quality, index);
-            }
-        }
-        set_check(self.c.remember, self.config.remember_key);
-        set_check(self.c.desktop_on, self.config.desktop_on);
-        set_check(self.c.mic_on, self.config.mic_on);
-        set_check(self.c.save_copy, self.config.save_copy);
-        for corner in t.corners {
-            add_item(self.c.corner, corner);
-        }
-        for size in t.sizes {
-            add_item(self.c.size, size);
-        }
-        select(self.c.corner, self.config.camera_corner as usize);
-        select(self.c.size, self.config.camera_size as usize);
-        set_check(self.c.mirror, self.config.camera_mirror);
-        set_check(self.c.camera_on, self.config.camera_on);
-        self.fill_cameras();
-        self.show_destination();
-        self.apply_audio();
-        self.start_preview();
-        self.update_hint();
-        self.apply_mode();
     }
 
-    fn handle(&mut self, msg: u32, wparam: WPARAM) -> Option<LRESULT> {
+    /// A small window over the main one (Settings, stream key), hidden until shown.
+    fn panel(&self, title: &str, width: i32, height: i32) -> Option<HWND> {
+        unsafe {
+            let mut frame = RECT { left: 0, top: 0, right: self.s(width), bottom: self.s(height) };
+            let _ = AdjustWindowRectExForDpi(&mut frame, PANEL_STYLE, false, WINDOW_EX_STYLE(0), self.dpi as u32);
+            let (w, h) = (frame.right - frame.left, frame.bottom - frame.top);
+            let mut owner = RECT::default();
+            let _ = GetWindowRect(self.hwnd, &mut owner);
+            let x = owner.left + ((owner.right - owner.left) - w) / 2;
+            let y = owner.top + self.s(40);
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("MilerCastPanel"),
+                &HSTRING::from(title),
+                PANEL_STYLE,
+                x,
+                y,
+                w,
+                h,
+                Some(self.hwnd),
+                None,
+                None,
+                None,
+            )
+            .ok()
+        }
+    }
+
+    /// Home when idle, the small Live panel while running.
+    fn show_page(&self, live: bool) {
+        for (controls, visible) in [(&self.home.all, !live), (&self.live.all, live)] {
+            for &control in controls {
+                unsafe {
+                    let _ = ShowWindow(control, if visible { SW_SHOW } else { SW_HIDE });
+                }
+            }
+        }
+        self.fit_window(self.hwnd, if live { live::HEIGHT } else { home::HEIGHT }, MAIN_STYLE);
+        // Repaint everything now, so no half-drawn page shows after the switch.
+        unsafe {
+            let _ = RedrawWindow(Some(self.hwnd), None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        }
+    }
+
+    fn handle(&mut self, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+        if self.settings.as_ref().is_some_and(|s| s.hwnd == hwnd) {
+            return self.settings_message(msg, wparam);
+        }
+        if self.key.as_ref().is_some_and(|k| k.hwnd == hwnd) {
+            return self.key_message(msg, wparam);
+        }
+        if hwnd != self.hwnd {
+            return None;
+        }
         match msg {
             WM_COMMAND => {
                 let (id, code) = (word(wparam.0) as u16, word(wparam.0 >> 16));
-                self.command(id, code);
-                Some(LRESULT(0))
-            }
-            WM_HSCROLL => {
-                self.apply_audio();
+                if !self.home_command(id, code) {
+                    self.live_command(id, code);
+                }
                 Some(LRESULT(0))
             }
             WM_TIMER => {
                 self.tick();
                 Some(LRESULT(0))
             }
-            WM_CLOSE => {
-                if self.engine.is_some() {
-                    if !self.confirm(self.text.quit_while_live) {
-                        return Some(LRESULT(0));
-                    }
-                    if let Some(engine) = self.engine.take() {
-                        engine.stop();
-                        let _ = engine.join();
-                    }
+            WM_HOTKEY => {
+                match wparam.0 {
+                    1 => self.set_mic(!self.config.mic_on),
+                    2 => self.set_game(!self.config.desktop_on),
+                    3 => self.set_camera(!self.config.camera_on),
+                    _ => {}
                 }
-                self.read_fields();
-                self.config.save();
+                Some(LRESULT(0))
+            }
+            WM_ACTIVATE => {
+                self.check_activity();
+                None
+            }
+            WM_SIZE => {
+                self.minimized = wparam.0 == SIZE_MINIMIZED as usize;
+                self.check_activity();
+                None
+            }
+            WM_TRAY => {
+                self.tray_event(word(lparam.0 as usize));
+                Some(LRESULT(0))
+            }
+            WM_CLOSE => {
+                if self.engine.is_some() && !self.confirm(self.text.quit_while_live) {
+                    return Some(LRESULT(0));
+                }
+                self.shutdown();
                 None // DefWindowProc destroys the window
             }
             WM_DESTROY => {
@@ -568,168 +685,35 @@ impl App {
         }
     }
 
-    fn command(&mut self, id: u16, code: u32) {
-        match (id, code) {
-            (ID_CAPTURE, CBN_DROPDOWN) => self.fill_captures(),
-            (ID_CAPTURE, CBN_SELCHANGE) => {
-                if let Some(choice) = self.choices.get(selected(self.c.capture)) {
-                    self.config.capture = choice.key();
-                }
-                self.update_hint();
-            }
-            (ID_YOUTUBE, BN_CLICKED) => self.choose_destination("youtube"),
-            (ID_TWITCH, BN_CLICKED) => self.choose_destination("twitch"),
-            (ID_CUSTOM, BN_CLICKED) => self.choose_destination("custom"),
-            (ID_SHOW_KEY, BN_CLICKED) => {
-                self.showing_key = !self.showing_key;
-                let mask = if self.showing_key { 0 } else { BLACK_DOT };
-                unsafe {
-                    SendMessageW(self.c.key, EM_SETPASSWORDCHAR, Some(WPARAM(mask)), None);
-                    let _ = InvalidateRect(Some(self.c.key), None, true);
-                }
-                set_text(self.c.show_key, if self.showing_key { self.text.hide } else { self.text.show });
-            }
-            (ID_DESKTOP_ON | ID_MIC_ON, BN_CLICKED) => self.apply_audio(),
-            (ID_MIC, CBN_SELCHANGE) => {
-                self.config.mic_name = self.mics.get(selected(self.c.mic)).cloned().unwrap_or_default();
+    /// Meters and quick updates only while one of our windows is in front;
+    /// a slow tick otherwise, just enough to notice the engine finishing.
+    fn check_activity(&mut self) {
+        let front = unsafe { GetForegroundWindow() };
+        let ours = front == self.hwnd
+            || self.settings.as_ref().is_some_and(|s| s.hwnd == front)
+            || self.key.as_ref().is_some_and(|k| k.hwnd == front);
+        let active = ours && !self.minimized;
+        let want_preview = active && self.mode == Mode::Idle;
+        if want_preview != self.preview_on {
+            self.preview_on = want_preview;
+            if want_preview {
                 self.start_preview();
+            } else {
+                self.preview.clear();
+                self.levels = [0.0; 2];
+                self.repaint_meters();
             }
-            (ID_CAMERA_ON, BN_CLICKED) => {
-                self.config.camera_on = checked(self.c.camera_on);
-                if self.camera_opened {
-                    self.overlay.set_visible(self.config.camera_on);
-                }
-            }
-            (ID_CAMERA, CBN_SELCHANGE) => {
-                if let Some(name) = self.cameras.get(selected(self.c.camera)) {
-                    self.config.camera_name = name.clone();
-                }
-            }
-            (ID_CORNER, CBN_SELCHANGE) => {
-                self.config.camera_corner = selected(self.c.corner).min(3) as u8;
-                self.overlay.set_corner(self.config.camera_corner);
-            }
-            (ID_SIZE, CBN_SELCHANGE) => {
-                self.config.camera_size = selected(self.c.size).min(2) as u8;
-                self.overlay.set_size(self.config.camera_size);
-            }
-            (ID_MIRROR, BN_CLICKED) => {
-                self.config.camera_mirror = checked(self.c.mirror);
-                self.overlay.set_mirror(self.config.camera_mirror);
-            }
-            (ID_GO_LIVE, BN_CLICKED) => match self.mode {
-                Mode::Idle => self.start(true),
-                _ => self.stop(),
-            },
-            (ID_RECORD, BN_CLICKED) => match self.mode {
-                Mode::Idle => self.start(false),
-                _ => self.stop(),
-            },
-            _ => {}
         }
-    }
-
-    fn fill_captures(&mut self) {
-        let current = self.choices.get(selected(self.c.capture)).map(Choice::key);
-        let wanted = current.unwrap_or_else(|| self.config.capture.clone());
-        self.choices = vec![Choice::Auto];
-        self.choices.extend(capture::list_windows().into_iter().map(|(hwnd, title)| Choice::Window(hwnd, title)));
-        self.choices.extend(capture::monitors().into_iter().enumerate().map(|(i, m)| Choice::Screen(i, m)));
-        unsafe { SendMessageW(self.c.capture, CB_RESETCONTENT, None, None) };
-        for choice in &self.choices {
-            let label = match choice {
-                Choice::Auto => self.text.auto_game.to_string(),
-                Choice::Window(_, title) => title.clone(),
-                Choice::Screen(index, monitor) => {
-                    let (w, h) = capture::monitor_size(*monitor);
-                    format!("{} {} ({w}×{h})", self.text.screen, index + 1)
-                }
-            };
-            add_item(self.c.capture, &label);
-        }
-        select(self.c.capture, self.choices.iter().position(|c| c.key() == wanted).unwrap_or(0));
-    }
-
-    fn fill_cameras(&mut self) {
-        self.cameras = camera::cameras();
-        unsafe { SendMessageW(self.c.camera, CB_RESETCONTENT, None, None) };
-        if self.cameras.is_empty() {
-            add_item(self.c.camera, self.text.no_camera);
-            select(self.c.camera, 0);
-            set_check(self.c.camera_on, false);
-            self.config.camera_on = false;
-            return;
-        }
-        for name in &self.cameras {
-            add_item(self.c.camera, name);
-        }
-        // The saved camera, else the first real one (virtual cameras re-send another app's picture).
-        let index = self
-            .cameras
-            .iter()
-            .position(|c| *c == self.config.camera_name)
-            .or_else(|| self.cameras.iter().position(|c| !c.to_lowercase().contains("virtual")))
-            .unwrap_or(0);
-        select(self.c.camera, index);
-        self.config.camera_name = self.cameras[index].clone();
-    }
-
-    fn fill_mics(&mut self) {
-        self.mics = vec![String::new()];
-        self.mics.extend(audio::microphones().unwrap_or_default().into_iter().map(|d| d.name));
-        unsafe { SendMessageW(self.c.mic, CB_RESETCONTENT, None, None) };
-        for name in &self.mics {
-            add_item(self.c.mic, if name.is_empty() { self.text.default_mic } else { name });
-        }
-        let index = self.mics.iter().position(|m| *m == self.config.mic_name).unwrap_or(0);
-        select(self.c.mic, index);
-        self.config.mic_name = self.mics[index].clone();
-    }
-
-    /// Switches destination, keeping what was typed for the custom server.
-    fn choose_destination(&mut self, destination: &str) {
-        if self.config.destination == "custom" {
-            self.config.custom_server = get_text(self.c.server);
-        }
-        self.config.destination = destination.to_string();
-        self.show_destination();
-    }
-
-    fn show_destination(&mut self) {
-        let destination = self.config.destination.clone();
-        let destination = destination.as_str();
-        set_check(self.c.youtube, destination == "youtube");
-        set_check(self.c.twitch, destination == "twitch");
-        set_check(self.c.custom, destination == "custom");
-        let server = match destination {
-            "youtube" => rtmp::YOUTUBE.to_string(),
-            "twitch" => rtmp::TWITCH.to_string(),
-            _ => self.config.custom_server.clone(),
+        let interval = if self.minimized {
+            1000
+        } else if active {
+            50
+        } else {
+            500
         };
-        set_text(self.c.server, &server);
-        set_text(self.c.key, &secret::load(destination).unwrap_or_default());
-        self.apply_mode();
-    }
-
-    /// Volumes and mute switches take effect at once, even while live.
-    fn apply_audio(&mut self) {
-        self.config.desktop_on = checked(self.c.desktop_on);
-        self.config.mic_on = checked(self.c.mic_on);
-        self.config.desktop_volume = slider(self.c.desktop_volume);
-        self.config.mic_volume = slider(self.c.mic_volume);
-        let gain = |on: bool, volume: u32| if on { volume as f32 / 100.0 } else { 0.0 };
-        self.desktop_gain.set(gain(self.config.desktop_on, self.config.desktop_volume));
-        self.mic_gain.set(gain(self.config.mic_on, self.config.mic_volume));
-        set_text(self.c.desktop_pct, &format!("{}%", self.config.desktop_volume));
-        set_text(self.c.mic_pct, &format!("{}%", self.config.mic_volume));
-    }
-
-    fn read_fields(&mut self) {
-        self.config.quality = selected(self.c.quality).min(PRESETS.len() - 1);
-        self.config.remember_key = checked(self.c.remember);
-        self.config.save_copy = checked(self.c.save_copy);
-        if self.config.destination == "custom" {
-            self.config.custom_server = get_text(self.c.server);
+        if interval != self.interval {
+            self.interval = interval;
+            unsafe { SetTimer(Some(self.hwnd), TIMER, interval, None) };
         }
     }
 
@@ -749,67 +733,110 @@ impl App {
         }
     }
 
-    fn update_hint(&self) {
-        let hint = match self.choices.get(selected(self.c.capture)) {
-            Some(Choice::Auto) => match capture::find_game() {
-                Some((_, title)) => format!("{}{title}", self.text.hint_found),
-                None => self.text.hint_auto.to_string(),
-            },
-            _ => String::new(),
-        };
-        set_text(self.c.capture_hint, &hint);
-    }
-
-    fn resolve_video(&self) -> Result<Video, &'static str> {
-        match self.choices.get(selected(self.c.capture)) {
-            Some(Choice::Window(hwnd, title)) => {
-                if unsafe { IsWindow(Some(*hwnd)) }.as_bool() {
-                    Ok(Video::window(*hwnd))
-                } else {
-                    capture::find_window(title).map(|(hwnd, _)| Video::window(hwnd)).ok_or(self.text.window_gone)
-                }
+    fn tick(&mut self) {
+        self.check_activity();
+        if self.preview_on {
+            let mut peaks = [0.0f32; 2];
+            for (slot, source) in &mut self.preview {
+                peaks[*slot] = peaks[*slot].max(source.drain_peak().unwrap_or(0.0));
             }
-            Some(Choice::Screen(_, monitor)) => Ok(Video::monitor(*monitor)),
-            _ => capture::find_game().map(|(hwnd, _)| Video::window(hwnd)).ok_or(self.text.no_game),
+            for (level, peak) in self.levels.iter_mut().zip(peaks) {
+                *level = meter_level(peak).max(*level - 0.04);
+            }
+            self.repaint_meters();
+        }
+        if self.last_status.elapsed() >= Duration::from_millis(500) {
+            self.last_status = Instant::now();
+            self.update_engine();
+        }
+        if self.mode == Mode::Idle && self.preview_on && self.last_hint.elapsed() >= Duration::from_secs(2) {
+            self.last_hint = Instant::now();
+            self.update_hint();
         }
     }
 
+    fn repaint_meters(&self) {
+        let meters = PAINT.with(|p| {
+            let mut p = p.borrow_mut();
+            p.levels = self.levels;
+            p.meters
+        });
+        for meter in meters {
+            unsafe {
+                let _ = InvalidateRect(Some(meter), None, false);
+            }
+        }
+    }
+
+    /// Volumes and mute switches take effect at once, even while live.
+    fn apply_gains(&self) {
+        let gain = |on: bool, volume: u32| if on { volume as f32 / 100.0 } else { 0.0 };
+        self.desktop_gain.set(gain(self.config.desktop_on, self.config.desktop_volume));
+        self.mic_gain.set(gain(self.config.mic_on, self.config.mic_volume));
+    }
+
+    fn set_mic(&mut self, on: bool) {
+        self.config.mic_on = on;
+        self.apply_gains();
+        self.sync_switches();
+    }
+
+    fn set_game(&mut self, on: bool) {
+        self.config.desktop_on = on;
+        self.apply_gains();
+        self.sync_switches();
+    }
+
+    fn set_camera(&mut self, on: bool) {
+        let running = self.mode != Mode::Idle;
+        if self.cameras.is_empty() || (running && !self.camera_opened) {
+            self.sync_switches();
+            return;
+        }
+        self.config.camera_on = on;
+        if self.camera_opened {
+            self.overlay.set_visible(on);
+        }
+        self.sync_switches();
+    }
+
+    /// Home's checkboxes and the Live panel's buttons show the same switches.
+    fn sync_switches(&self) {
+        self.sync_home_switches();
+        self.sync_live_switches();
+    }
+
     fn start(&mut self, live: bool) {
-        self.read_fields();
+        self.read_settings_window();
         let video = match self.resolve_video() {
             Ok(video) => video,
-            Err(message) => return self.warn(message),
+            Err(problem) => return self.notice(problem, Tone::Bad),
         };
         let mut stream = None;
         if live {
             let destination = self.config.destination.clone();
             let server = match destination.as_str() {
-                "youtube" | "twitch" => destination.clone(),
-                _ => get_text(self.c.server).trim().to_string(),
+                "custom" => self.config.custom_server.trim().to_string(),
+                other => other.to_string(),
             };
-            if !server.starts_with("rtmp://") && destination == "custom" {
-                return self.warn(self.text.need_server);
+            if destination == "custom" && !server.starts_with("rtmp://") {
+                return self.notice(self.text.need_server, Tone::Bad);
             }
-            let key = get_text(self.c.key).trim().to_string();
-            if key.is_empty() {
-                return self.warn(self.text.need_key);
-            }
-            if self.config.remember_key {
-                secret::save(&destination, &key);
-            } else {
-                secret::delete(&destination);
-            }
+            let Some(key) = secret::load(&destination) else {
+                // First time: ask for the key instead of failing.
+                return self.open_key_dialog();
+            };
             stream = Some((server, key));
         }
         self.record_path = (!live || self.config.save_copy).then(recording_path);
-        let (height, fps, video_kbps, _) = PRESETS[self.config.quality];
+        let (height, fps, video_kbps, _) = PRESETS[self.config.quality.min(PRESETS.len() - 1)];
         // The camera opens only if it's switched on: its light should never come on by surprise.
         let camera = (self.config.camera_on && !self.cameras.is_empty()).then(|| {
             self.overlay.set_visible(true);
             CameraChoice { name: Some(self.config.camera_name.clone()), overlay: self.overlay.clone() }
         });
         self.camera_opened = camera.is_some();
-        // Both sources always open, so switching one back on mid-stream works.
+        // Both sources always open, so muting and unmuting works mid-stream.
         let settings = Settings {
             video,
             height,
@@ -828,178 +855,132 @@ impl App {
         };
         self.config.save();
         self.preview.clear();
-        self.live = live;
+        self.preview_on = false;
+        self.live_mode = live;
+        self.warned = false;
         self.engine = Some(Engine::start(settings));
         self.mode = Mode::Starting;
+        self.hotkeys(true);
         self.upload = (0, Instant::now(), 0.0);
         self.drops = (0, Instant::now());
-        self.apply_mode();
-        self.set_status(if live { self.text.connecting } else { self.text.starting }, None);
-        set_text(self.c.stats, "");
+        self.notice("", Tone::Plain);
+        self.enter_live_panel();
+        self.update_settings_window();
     }
 
     fn stop(&mut self) {
         if let Some(engine) = &self.engine {
             engine.stop();
             self.mode = Mode::Stopping;
-            self.apply_mode();
-            self.set_status(self.text.finishing, None);
+            self.update_live_panel();
         }
     }
 
-    /// Enables what can be used in the current mode, and labels the big buttons.
-    fn apply_mode(&self) {
-        let idle = self.mode == Mode::Idle;
-        let t = self.text;
-        for control in [
-            self.c.capture,
-            self.c.youtube,
-            self.c.twitch,
-            self.c.custom,
-            self.c.key,
-            self.c.show_key,
-            self.c.remember,
-            self.c.mic,
-            self.c.quality,
-            self.c.save_copy,
-        ] {
-            enable(control, idle);
-        }
-        enable(self.c.server, idle && self.config.destination == "custom");
-        let has_camera = !self.cameras.is_empty();
-        enable(self.c.camera, idle && has_camera);
-        enable(self.c.camera_on, has_camera && (idle || self.camera_opened));
-        let busy = matches!(self.mode, Mode::Starting | Mode::Running);
-        set_text(self.c.go_live, if busy && self.live { t.end_stream } else { t.go_live });
-        set_text(self.c.record, if busy && !self.live { t.stop_recording } else { t.record });
-        enable(self.c.go_live, idle || (busy && self.live));
-        enable(self.c.record, idle || (busy && !self.live));
-    }
-
-    fn tick(&mut self) {
-        self.ticks += 1;
-        let peaks = match &self.engine {
-            Some(engine) => {
-                let (desktop, mic) = engine.state().take_peaks();
-                [desktop, mic]
-            }
-            None => {
-                let mut peaks = [0.0f32; 2];
-                for (slot, source) in &mut self.preview {
-                    peaks[*slot] = peaks[*slot].max(source.drain_peak().unwrap_or(0.0));
-                }
-                peaks
-            }
-        };
-        for (level, peak) in self.levels.iter_mut().zip(peaks) {
-            *level = meter_level(peak).max(*level - 0.04);
-        }
-        let meters = PAINT.with(|p| {
-            let mut p = p.borrow_mut();
-            p.levels = self.levels;
-            p.meters
-        });
-        for meter in meters {
-            unsafe {
-                let _ = InvalidateRect(Some(meter), None, false);
-            }
-        }
-        if self.ticks % 10 == 0 {
-            self.update_status();
-        }
-        if self.mode == Mode::Idle && self.ticks % 40 == 0 {
-            self.update_hint();
-        }
-    }
-
-    fn update_status(&mut self) {
+    fn update_engine(&mut self) {
         let Some(engine) = &self.engine else { return };
         let state = engine.state().clone();
-        let t = self.text;
         match state.phase() {
             Phase::Starting => {}
             Phase::Running => {
                 if self.mode == Mode::Starting {
                     self.mode = Mode::Running;
-                    self.apply_mode();
-                    // E.g. the camera or a microphone couldn't be opened: say so once.
-                    let warnings: Vec<String> = state.info().into_iter().filter(|l| l.starts_with("warning:")).collect();
-                    if !warnings.is_empty() {
-                        self.warn(&warnings.join("\n"));
-                    }
                 }
-                if self.mode == Mode::Stopping {
-                    return;
-                }
-                let time = clock(state.elapsed().as_secs());
-                let red = Some(rgb(200, 30, 45));
-                match state.network() {
-                    Some(net) => {
-                        let now = Instant::now();
-                        let since = now.duration_since(self.upload.1).as_secs_f64();
-                        if since >= 1.0 {
-                            let sent = net.sent_bytes();
-                            self.upload = (sent, now, (sent - self.upload.0) as f64 * 8.0 / 1_000_000.0 / since);
-                        }
-                        let dropped = net.dropped_frames();
-                        if dropped != self.drops.0 {
-                            self.drops = (dropped, now);
-                        }
-                        let unstable = dropped > 0 && self.drops.1.elapsed().as_secs() < 10;
-                        match net.status() {
-                            Status::Reconnecting(why) => {
-                                self.set_status(&format!("●  {} ({why})", t.reconnecting), Some(rgb(190, 120, 0)))
-                            }
-                            _ => self.set_status(&format!("●  {}   {time}", t.live), red),
-                        }
-                        let connection = if unstable { t.connection_unstable } else { t.connection_good };
-                        set_text(
-                            self.c.stats,
-                            &format!("{} {:.1} Mbps  ·  {} {dropped}  ·  {connection}", t.upload, self.upload.2, t.dropped),
-                        );
-                    }
-                    None => {
-                        self.set_status(&format!("●  {}   {time}", t.recording), red);
-                        if let Some(path) = &self.record_path {
-                            set_text(self.c.stats, &path.display().to_string());
-                        }
-                    }
-                }
+                self.refresh_live(&state);
             }
             Phase::Finished(_) => {
                 let was_running = self.mode != Mode::Starting;
                 let result = self.engine.take().map(Engine::join).unwrap_or(Ok(()));
                 self.mode = Mode::Idle;
-                self.apply_mode();
-                self.start_preview();
-                set_text(self.c.stats, "");
-                match result {
-                    Ok(()) => match &self.record_path {
-                        Some(path) => {
-                            self.set_status(t.ready, None);
-                            set_text(self.c.stats, &format!("{}{}", t.saved_to, path.display()));
-                        }
-                        None => self.set_status(t.ready, None),
-                    },
-                    Err(e) => {
-                        self.set_status(t.ready, None);
+                self.hotkeys(false);
+                self.camera_opened = false;
+                self.show_page(false);
+                self.sync_switches();
+                self.update_settings_window();
+                tray::update(self.hwnd, "MilerCast");
+                let t = self.text;
+                match (result, &self.record_path) {
+                    (Ok(()), Some(path)) => self.notice(&format!("{}{}", t.saved_to, path.display()), Tone::Good),
+                    (Ok(()), None) => self.notice(t.stream_ended, Tone::Muted),
+                    (Err(e), _) => {
                         let prefix = if was_running { t.stopped_because } else { t.could_not_start };
-                        self.warn(&format!("{prefix}{e}"));
+                        self.notice(&format!("{prefix}{e}"), Tone::Bad);
                     }
                 }
+                self.check_activity();
             }
         }
     }
 
-    fn set_status(&self, label: &str, color: Option<COLORREF>) {
-        PAINT.with(|p| p.borrow_mut().status_color = color);
-        set_text(self.c.status, label);
+    fn resolve_video(&self) -> Result<Video, &'static str> {
+        match self.choices.get(selected(self.home.capture)) {
+            Some(Choice::Window(hwnd, title)) => {
+                if unsafe { IsWindow(Some(*hwnd)) }.as_bool() {
+                    Ok(Video::window(*hwnd))
+                } else {
+                    capture::find_window(title).map(|(hwnd, _)| Video::window(hwnd)).ok_or(self.text.window_gone)
+                }
+            }
+            Some(Choice::Screen(_, monitor)) => Ok(Video::monitor(*monitor)),
+            _ => capture::find_game().map(|(hwnd, _)| Video::window(hwnd)).ok_or(self.text.no_game),
+        }
     }
 
-    fn warn(&self, message: &str) {
-        unsafe {
-            MessageBoxW(Some(self.hwnd), &HSTRING::from(message), w!("MilerCast"), MB_OK | MB_ICONWARNING);
+    fn tray_event(&mut self, mouse: u32) {
+        match mouse {
+            WM_LBUTTONUP => self.bring_to_front(),
+            WM_RBUTTONUP => {
+                let t = self.text;
+                let running = self.engine.is_some();
+                let end = if self.live_mode { t.end_stream } else { t.stop_recording };
+                let choice = tray::menu(
+                    self.hwnd,
+                    &[
+                        (1, t.tray_show, false),
+                        (0, "", false),
+                        (2, t.mic, self.config.mic_on),
+                        (3, t.game, self.config.desktop_on),
+                        (0, "", false),
+                        (if running { 4 } else { 0 }, if running { end } else { "" }, false),
+                        (5, t.quit, false),
+                    ],
+                );
+                match choice {
+                    1 => self.bring_to_front(),
+                    2 => self.set_mic(!self.config.mic_on),
+                    3 => self.set_game(!self.config.desktop_on),
+                    4 => self.stop(),
+                    5 => {
+                        if self.engine.is_none() || self.confirm(t.quit_while_live) {
+                            self.shutdown();
+                            unsafe {
+                                let _ = DestroyWindow(self.hwnd);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
         }
+    }
+
+    fn bring_to_front(&self) {
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_RESTORE);
+            let _ = SetForegroundWindow(self.hwnd);
+        }
+    }
+
+    /// Stops the engine, saves settings and tidies up before the window goes.
+    fn shutdown(&mut self) {
+        if let Some(engine) = self.engine.take() {
+            engine.stop();
+            let _ = engine.join();
+        }
+        self.read_settings_window();
+        self.config.save();
+        self.close_settings_window();
+        tray::remove(self.hwnd);
     }
 
     fn confirm(&self, question: &str) -> bool {
@@ -1009,7 +990,7 @@ impl App {
     }
 }
 
-fn fonts(dpi: i32, thai: bool) -> (HFONT, HFONT) {
+fn fonts(dpi: i32, thai: bool) -> Fonts {
     let mut metrics = NONCLIENTMETRICSW { cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
     unsafe {
         let _ = SystemParametersInfoForDpi(
@@ -1030,10 +1011,14 @@ fn fonts(dpi: i32, thai: bool) -> (HFONT, HFONT) {
     }
     let mut bold = font;
     bold.lfWeight = FW_SEMIBOLD.0 as i32;
-    unsafe { (CreateFontIndirectW(&font), CreateFontIndirectW(&bold)) }
+    let mut big = bold;
+    big.lfHeight = bold.lfHeight * 3 / 2;
+    unsafe {
+        Fonts { normal: CreateFontIndirectW(&font), bold: CreateFontIndirectW(&bold), big: CreateFontIndirectW(&big) }
+    }
 }
 
-fn recording_path() -> PathBuf {
+fn recordings_folder() -> PathBuf {
     let videos = unsafe {
         SHGetKnownFolderPath(&FOLDERID_Videos, KF_FLAG_DEFAULT, None).ok().map(|path| {
             let text = path.to_string().unwrap_or_default();
@@ -1041,20 +1026,65 @@ fn recording_path() -> PathBuf {
             PathBuf::from(text)
         })
     };
+    videos.unwrap_or_else(|| PathBuf::from(".")).join("MilerCast")
+}
+
+fn recording_path() -> PathBuf {
     let t = unsafe { GetLocalTime() };
-    videos.unwrap_or_else(|| PathBuf::from(".")).join("MilerCast").join(format!(
+    recordings_folder().join(format!(
         "milercast-{:04}{:02}{:02}-{:02}{:02}{:02}.flv",
         t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
     ))
+}
+
+/// Opens a web page or folder the user asked for.
+fn open(target: &str) {
+    unsafe {
+        ShellExecuteW(None, w!("open"), &HSTRING::from(target), None, None, SW_SHOWNORMAL);
+    }
 }
 
 fn clock(secs: u64) -> String {
     format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
 }
 
+fn set_font(control: HWND, font: HFONT) {
+    unsafe {
+        SendMessageW(control, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+    }
+}
+
 fn set_text(control: HWND, text: &str) {
     unsafe {
         let _ = SetWindowTextW(control, &HSTRING::from(text));
+    }
+}
+
+/// Sets a label's text and colour.
+fn paint_text(control: HWND, text: &str, tone: Tone) {
+    PAINT.with(|p| {
+        let mut p = p.borrow_mut();
+        p.colors.retain(|(hwnd, _)| *hwnd != control);
+        if let Some(color) = tone.color() {
+            p.colors.push((control, color));
+        }
+    });
+    set_text(control, text);
+    unsafe {
+        let _ = InvalidateRect(Some(control), None, true);
+    }
+}
+
+/// Destroys a panel and drops its labels from the paint lists, because
+/// Windows hands their handles out again to new controls.
+fn destroy_panel(window: HWND) {
+    PAINT.with(|p| {
+        let mut p = p.borrow_mut();
+        p.muted.retain(|&hwnd| !unsafe { IsChild(window, hwnd) }.as_bool());
+        p.colors.retain(|&(hwnd, _)| !unsafe { IsChild(window, hwnd) }.as_bool());
+    });
+    unsafe {
+        let _ = DestroyWindow(window);
     }
 }
 
@@ -1108,4 +1138,19 @@ fn enable(control: HWND, on: bool) {
     unsafe {
         let _ = EnableWindow(control, on);
     }
+}
+
+fn invalidate(control: HWND) {
+    unsafe {
+        let _ = InvalidateRect(Some(control), None, true);
+    }
+}
+
+/// Cursor position, for placing the tray menu.
+fn cursor() -> POINT {
+    let mut point = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut point);
+    }
+    point
 }

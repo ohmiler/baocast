@@ -21,23 +21,50 @@ code-signed yet.
 
 ## The window
 
-Double-click `milercast.exe`:
+Double-click `milercast.exe`. There are three screens, and most days you only
+need the first one.
+
+**Home** has everything you touch before going live:
 
 - **Capture:** the fullscreen game is picked automatically, or choose any window or screen.
-- **Stream to:** YouTube, Twitch or a custom RTMP server. The stream key is
-  remembered in Windows Credential Manager, encrypted with your Windows login.
-- **Audio:** game sound and microphone with volume, mute and live level meters,
-  all adjustable while live.
-- **Camera:** your webcam in a corner (small, medium or large, optionally mirrored).
-  Corner, size, mirror and show/hide all change while live. It's off until you
-  switch it on, so the camera light never comes on by surprise.
-- **Quality:** a few presets (1080p60 at 6 Mbps is the default).
-- **Go live** or **Record**, with live time, upload rate, dropped frames and
-  connection status while it runs.
+- **Stream to:** YouTube, Twitch or a custom RTMP server. **Add key** opens a small
+  window to paste your stream key, with a **Where's my key?** button that opens
+  the right page on YouTube or Twitch. The key is kept in Windows Credential
+  Manager, encrypted with your Windows login, and never shown again.
+- **Sound:** game and mic switches with live level meters.
+- **Camera:** your webcam in a corner. Pick the corner and size (small, medium,
+  large) right there. It's off until you switch it on, so the camera light never
+  comes on by surprise.
+- A big **Go live** button, and **Record** for a local file.
+
+Problems show up as a line of text under the buttons ("No fullscreen game
+found…", "the server refused the stream key"), not as pop-ups.
+
+**Live panel** replaces Home while you're live or recording: the time, upload
+rate, dropped frames and connection status, big mic / game / camera switches, and
+**End stream**. While it runs, these hotkeys work from inside your game:
+
+| Hotkey | Does |
+| --- | --- |
+| Ctrl+Alt+M | Mute or unmute the mic |
+| Ctrl+Alt+G | Mute or unmute game sound |
+| Ctrl+Alt+C | Show or hide the camera |
+
+The hotkeys are only taken while you're live or recording, so they never clash
+with other programs (or switch your camera on) the rest of the time. A tray icon
+shows the live time in its tooltip, and right-clicking it mutes or ends the
+stream without opening the window.
+
+**Settings** holds what you set once: custom server, microphone, mic and game
+volume, camera device and mirror, quality preset (1080p60 at 6 Mbps is the
+default), saving a copy of every stream, and the recordings folder
+(`Videos\MilerCast`). Changes apply immediately; volumes and mirror can change
+while live.
 
 The window speaks English or Thai, following your Windows display language
-(set `MILERCAST_LANG=th` or `en` to choose). It uses plain Windows controls: about
-0.05% CPU and 19 MB of RAM while open, and nothing on the GPU.
+(set `MILERCAST_LANG=th` or `en` to choose). It uses plain Windows controls and
+nothing on the GPU: about 0.08% CPU and 22 MB of RAM while open in front. The
+level meters only run while the window is in front and not minimized.
 
 ## How it works
 
@@ -71,7 +98,7 @@ The engine is a library shared by the window (`milercast.exe`) and the command
 line (`milercast-cli.exe`).
 
 Early numbers (RTX 3060 Ti, i7-12700, streaming a 1440p monitor at 1080p60 with
-desktop audio): 0.39% CPU, about 77 MB RAM, and executables under 400 KB. In
+desktop audio): 0.39% CPU, about 77 MB RAM, and executables under 500 KB. In
 Dota 2 the frame rate didn't drop while streaming. A side-by-side table against
 OBS (average FPS and 1% lows) is still to come.
 
@@ -110,7 +137,9 @@ cargo build --release
 3. Live streaming over RTMP to Twitch / YouTube. ✅ (v0.1)
 4. A window: game auto-detection, saved key, audio meters, presets, live status. ✅
 5. Webcam corner. ✅ (Capture cards as the main source are next.)
-6. Tray icon and hotkeys, game-only audio, RTMPS, automatic bitrate.
+6. A simpler window: Home / Live / Settings, stream key helper, tray icon, hotkeys. ✅
+7. A small preview (only while the window is open), upload speed test, mic test.
+8. Game-only audio, RTMPS, automatic bitrate.
 
 ## License
 
