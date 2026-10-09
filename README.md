@@ -12,7 +12,8 @@ misconfigured into lagging.
 **Status:** v0.1, early but working. Baocast streams a window or monitor, game
 audio and your microphone live to Twitch, YouTube or any RTMP server, and can
 record to an `.flv` file at the same time. It has been tested live on YouTube
-while playing Dota 2: stream health "Excellent", with no noticeable lag in game.
+while playing Dota 2: stream health "Excellent", and the game's frame rate (Steam
+FPS counter) was the same while streaming as without streaming.
 
 Download `baocast.exe` from [Releases](https://github.com/ohmiler/baocast/releases).
 Windows may warn that the file is from an unknown publisher, because it isn't
@@ -42,8 +43,9 @@ microphone (WASAPI) ────────┘
 The only dependency is Microsoft's [`windows`](https://crates.io/crates/windows) crate.
 
 Early numbers (RTX 3060 Ti, i7-12700, streaming a 1440p monitor at 1080p60 with
-desktop audio): 0.39% CPU, about 77 MB RAM, and a 358 KB executable. Game
-frame-rate benchmarks against OBS are still to come.
+desktop audio): 0.39% CPU, about 77 MB RAM, and a 358 KB executable. In Dota 2
+the frame rate didn't drop while streaming. A side-by-side table against OBS
+(average FPS and 1% lows) is still to come.
 
 ## Usage
 
