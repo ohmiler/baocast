@@ -8,6 +8,7 @@ mod text;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -31,8 +32,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HSTRING, PCWSTR, w};
 
 use milercast::audio::{self, Gain};
+use milercast::camera::{self, Overlay};
 use milercast::capture;
-use milercast::engine::{Engine, Mic, Phase, Settings, Video};
+use milercast::engine::{CameraChoice, Engine, Mic, Phase, Settings, Video};
 use milercast::rtmp::{self, Status};
 
 use config::Config;
@@ -84,10 +86,15 @@ const ID_GO_LIVE: u16 = 111;
 const ID_RECORD: u16 = 112;
 const ID_SERVER: u16 = 113;
 const ID_KEY: u16 = 114;
+const ID_CAMERA_ON: u16 = 115;
+const ID_CAMERA: u16 = 116;
+const ID_CORNER: u16 = 117;
+const ID_SIZE: u16 = 118;
+const ID_MIRROR: u16 = 119;
 const ID_OTHER: u16 = 199;
 
 const TIMER: usize = 1;
-const CLIENT: (i32, i32) = (420, 556);
+const CLIENT: (i32, i32) = (420, 642);
 
 /// (height, fps, kbps, note: 0 none, 1 recommended, 2 YouTube, 3 slow internet)
 const PRESETS: [(u32, u32, u32, u8); 5] =
@@ -130,6 +137,11 @@ struct Controls {
     mic_volume: HWND,
     mic_pct: HWND,
     mic: HWND,
+    camera_on: HWND,
+    camera: HWND,
+    corner: HWND,
+    size: HWND,
+    mirror: HWND,
     quality: HWND,
     save_copy: HWND,
     go_live: HWND,
@@ -175,6 +187,11 @@ struct App {
     mics: Vec<String>,
     desktop_gain: Gain,
     mic_gain: Gain,
+    /// Camera placement, shared with the engine so it can change while live.
+    overlay: Arc<Overlay>,
+    cameras: Vec<String>,
+    /// Whether the running engine was started with the camera.
+    camera_opened: bool,
     /// Audio opened only for the level meters while not live.
     preview: Vec<(usize, audio::Source)>,
     levels: [f32; 2],
@@ -333,6 +350,7 @@ impl App {
         let text = text::current();
         let (font, bold) = fonts(dpi, text.thai);
         let config = Config::load();
+        let overlay = Overlay::new(false, config.camera_corner, config.camera_size, config.camera_mirror);
         let mut app = App {
             hwnd,
             text,
@@ -342,6 +360,9 @@ impl App {
             c: Controls::default(),
             desktop_gain: Gain::new(0.0),
             mic_gain: Gain::new(0.0),
+            overlay,
+            cameras: Vec::new(),
+            camera_opened: false,
             config,
             choices: Vec::new(),
             mics: Vec::new(),
@@ -429,15 +450,22 @@ impl App {
         self.c.mic = self.add(combo, "", CBS_DROPDOWNLIST | VSCROLL | TABSTOP, 0, (16, 332, 388, 240), ID_MIC);
         let mic_meter = self.add(w!("STATIC"), "", SS_OWNERDRAW, 0, (16, 362, 388, 6), ID_OTHER);
 
-        self.heading(t.quality, 380);
-        self.c.quality = self.add(combo, "", CBS_DROPDOWNLIST | TABSTOP, 0, (16, 402, 388, 200), ID_QUALITY);
-        self.c.save_copy = self.add(button, t.save_copy, BS_AUTOCHECKBOX | TABSTOP, 0, (16, 434, 388, 20), ID_SAVE_COPY);
+        self.heading(t.camera, 380);
+        self.c.camera_on = self.add(button, t.show_camera, BS_AUTOCHECKBOX | TABSTOP, 0, (16, 403, 130, 22), ID_CAMERA_ON);
+        self.c.camera = self.add(combo, "", CBS_DROPDOWNLIST | VSCROLL | TABSTOP, 0, (150, 402, 254, 200), ID_CAMERA);
+        self.c.corner = self.add(combo, "", CBS_DROPDOWNLIST | TABSTOP, 0, (16, 434, 150, 200), ID_CORNER);
+        self.c.size = self.add(combo, "", CBS_DROPDOWNLIST | TABSTOP, 0, (174, 434, 110, 200), ID_SIZE);
+        self.c.mirror = self.add(button, t.mirror, BS_AUTOCHECKBOX | TABSTOP, 0, (294, 436, 110, 22), ID_MIRROR);
 
-        self.c.go_live = self.add(button, t.go_live, TABSTOP, 0, (16, 466, 250, 38), ID_GO_LIVE);
-        self.c.record = self.add(button, t.record, TABSTOP, 0, (274, 466, 130, 38), ID_RECORD);
-        self.c.status = self.label(t.ready, (16, 514, 388, 20));
+        self.heading(t.quality, 466);
+        self.c.quality = self.add(combo, "", CBS_DROPDOWNLIST | TABSTOP, 0, (16, 488, 388, 200), ID_QUALITY);
+        self.c.save_copy = self.add(button, t.save_copy, BS_AUTOCHECKBOX | TABSTOP, 0, (16, 520, 388, 20), ID_SAVE_COPY);
+
+        self.c.go_live = self.add(button, t.go_live, TABSTOP, 0, (16, 552, 250, 38), ID_GO_LIVE);
+        self.c.record = self.add(button, t.record, TABSTOP, 0, (274, 552, 130, 38), ID_RECORD);
+        self.c.status = self.label(t.ready, (16, 600, 388, 20));
         unsafe { SendMessageW(self.c.status, WM_SETFONT, Some(WPARAM(self.bold.0 as usize)), Some(LPARAM(1))) };
-        self.c.stats = self.label("", (16, 534, 388, 18));
+        self.c.stats = self.label("", (16, 620, 388, 18));
 
         PAINT.with(|p| {
             let mut p = p.borrow_mut();
@@ -485,6 +513,17 @@ impl App {
         set_check(self.c.desktop_on, self.config.desktop_on);
         set_check(self.c.mic_on, self.config.mic_on);
         set_check(self.c.save_copy, self.config.save_copy);
+        for corner in t.corners {
+            add_item(self.c.corner, corner);
+        }
+        for size in t.sizes {
+            add_item(self.c.size, size);
+        }
+        select(self.c.corner, self.config.camera_corner as usize);
+        select(self.c.size, self.config.camera_size as usize);
+        set_check(self.c.mirror, self.config.camera_mirror);
+        set_check(self.c.camera_on, self.config.camera_on);
+        self.fill_cameras();
         self.show_destination();
         self.apply_audio();
         self.start_preview();
@@ -555,6 +594,29 @@ impl App {
                 self.config.mic_name = self.mics.get(selected(self.c.mic)).cloned().unwrap_or_default();
                 self.start_preview();
             }
+            (ID_CAMERA_ON, BN_CLICKED) => {
+                self.config.camera_on = checked(self.c.camera_on);
+                if self.camera_opened {
+                    self.overlay.set_visible(self.config.camera_on);
+                }
+            }
+            (ID_CAMERA, CBN_SELCHANGE) => {
+                if let Some(name) = self.cameras.get(selected(self.c.camera)) {
+                    self.config.camera_name = name.clone();
+                }
+            }
+            (ID_CORNER, CBN_SELCHANGE) => {
+                self.config.camera_corner = selected(self.c.corner).min(3) as u8;
+                self.overlay.set_corner(self.config.camera_corner);
+            }
+            (ID_SIZE, CBN_SELCHANGE) => {
+                self.config.camera_size = selected(self.c.size).min(2) as u8;
+                self.overlay.set_size(self.config.camera_size);
+            }
+            (ID_MIRROR, BN_CLICKED) => {
+                self.config.camera_mirror = checked(self.c.mirror);
+                self.overlay.set_mirror(self.config.camera_mirror);
+            }
             (ID_GO_LIVE, BN_CLICKED) => match self.mode {
                 Mode::Idle => self.start(true),
                 _ => self.stop(),
@@ -586,6 +648,30 @@ impl App {
             add_item(self.c.capture, &label);
         }
         select(self.c.capture, self.choices.iter().position(|c| c.key() == wanted).unwrap_or(0));
+    }
+
+    fn fill_cameras(&mut self) {
+        self.cameras = camera::cameras();
+        unsafe { SendMessageW(self.c.camera, CB_RESETCONTENT, None, None) };
+        if self.cameras.is_empty() {
+            add_item(self.c.camera, self.text.no_camera);
+            select(self.c.camera, 0);
+            set_check(self.c.camera_on, false);
+            self.config.camera_on = false;
+            return;
+        }
+        for name in &self.cameras {
+            add_item(self.c.camera, name);
+        }
+        // The saved camera, else the first real one (virtual cameras re-send another app's picture).
+        let index = self
+            .cameras
+            .iter()
+            .position(|c| *c == self.config.camera_name)
+            .or_else(|| self.cameras.iter().position(|c| !c.to_lowercase().contains("virtual")))
+            .unwrap_or(0);
+        select(self.c.camera, index);
+        self.config.camera_name = self.cameras[index].clone();
     }
 
     fn fill_mics(&mut self) {
@@ -717,6 +803,12 @@ impl App {
         }
         self.record_path = (!live || self.config.save_copy).then(recording_path);
         let (height, fps, video_kbps, _) = PRESETS[self.config.quality];
+        // The camera opens only if it's switched on: its light should never come on by surprise.
+        let camera = (self.config.camera_on && !self.cameras.is_empty()).then(|| {
+            self.overlay.set_visible(true);
+            CameraChoice { name: Some(self.config.camera_name.clone()), overlay: self.overlay.clone() }
+        });
+        self.camera_opened = camera.is_some();
         // Both sources always open, so switching one back on mid-stream works.
         let settings = Settings {
             video,
@@ -729,6 +821,7 @@ impl App {
                 gain: self.mic_gain.clone(),
             }),
             audio_kbps: 160,
+            camera,
             live: stream,
             record_to: self.record_path.clone(),
             stop_after: None,
@@ -773,6 +866,9 @@ impl App {
             enable(control, idle);
         }
         enable(self.c.server, idle && self.config.destination == "custom");
+        let has_camera = !self.cameras.is_empty();
+        enable(self.c.camera, idle && has_camera);
+        enable(self.c.camera_on, has_camera && (idle || self.camera_opened));
         let busy = matches!(self.mode, Mode::Starting | Mode::Running);
         set_text(self.c.go_live, if busy && self.live { t.end_stream } else { t.go_live });
         set_text(self.c.record, if busy && !self.live { t.stop_recording } else { t.record });
@@ -826,6 +922,11 @@ impl App {
                 if self.mode == Mode::Starting {
                     self.mode = Mode::Running;
                     self.apply_mode();
+                    // E.g. the camera or a microphone couldn't be opened: say so once.
+                    let warnings: Vec<String> = state.info().into_iter().filter(|l| l.starts_with("warning:")).collect();
+                    if !warnings.is_empty() {
+                        self.warn(&warnings.join("\n"));
+                    }
                 }
                 if self.mode == Mode::Stopping {
                     return;

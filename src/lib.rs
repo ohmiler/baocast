@@ -9,6 +9,7 @@
 pub mod aac;
 mod amf;
 pub mod audio;
+pub mod camera;
 pub mod capture;
 mod convert;
 mod encoder;

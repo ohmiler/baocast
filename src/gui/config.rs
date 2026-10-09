@@ -17,6 +17,14 @@ pub struct Config {
     pub mic_volume: u32,
     /// Empty for the Windows default microphone.
     pub mic_name: String,
+    /// Off unless the user turns it on: a camera should never switch on by surprise.
+    pub camera_on: bool,
+    pub camera_name: String,
+    /// 0 top left, 1 top right, 2 bottom left, 3 bottom right.
+    pub camera_corner: u8,
+    /// 0 small, 1 medium, 2 large.
+    pub camera_size: u8,
+    pub camera_mirror: bool,
     pub save_copy: bool,
 }
 
@@ -33,6 +41,11 @@ impl Default for Config {
             mic_on: true,
             mic_volume: 100,
             mic_name: String::new(),
+            camera_on: false,
+            camera_name: String::new(),
+            camera_corner: 3,
+            camera_size: 1,
+            camera_mirror: false,
             save_copy: false,
         }
     }
@@ -62,6 +75,11 @@ impl Config {
                 "mic_on" => config.mic_on = flag,
                 "mic_volume" => config.mic_volume = number.unwrap_or(100).min(200),
                 "mic_name" => config.mic_name = value,
+                "camera_on" => config.camera_on = flag,
+                "camera_name" => config.camera_name = value,
+                "camera_corner" => config.camera_corner = number.unwrap_or(3).min(3) as u8,
+                "camera_size" => config.camera_size = number.unwrap_or(1).min(2) as u8,
+                "camera_mirror" => config.camera_mirror = flag,
                 "save_copy" => config.save_copy = flag,
                 _ => {}
             }
@@ -74,7 +92,8 @@ impl Config {
         let flag = |on: bool| if on { "1" } else { "0" };
         let text = format!(
             "capture={}\ndestination={}\ncustom_server={}\nremember_key={}\nquality={}\n\
-             desktop_on={}\ndesktop_volume={}\nmic_on={}\nmic_volume={}\nmic_name={}\nsave_copy={}\n",
+             desktop_on={}\ndesktop_volume={}\nmic_on={}\nmic_volume={}\nmic_name={}\n\
+             camera_on={}\ncamera_name={}\ncamera_corner={}\ncamera_size={}\ncamera_mirror={}\nsave_copy={}\n",
             self.capture,
             self.destination,
             self.custom_server,
@@ -85,6 +104,11 @@ impl Config {
             flag(self.mic_on),
             self.mic_volume,
             self.mic_name,
+            flag(self.camera_on),
+            self.camera_name,
+            self.camera_corner,
+            self.camera_size,
+            flag(self.camera_mirror),
             flag(self.save_copy),
         );
         if let Some(dir) = path.parent() {

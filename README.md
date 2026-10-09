@@ -28,6 +28,9 @@ Double-click `milercast.exe`:
   remembered in Windows Credential Manager, encrypted with your Windows login.
 - **Audio:** game sound and microphone with volume, mute and live level meters,
   all adjustable while live.
+- **Camera:** your webcam in a corner (small, medium or large, optionally mirrored).
+  Corner, size, mirror and show/hide all change while live. It's off until you
+  switch it on, so the camera light never comes on by surprise.
 - **Quality:** a few presets (1080p60 at 6 Mbps is the default).
 - **Go live** or **Record**, with live time, upload rate, dropped frames and
   connection status while it runs.
@@ -52,6 +55,11 @@ microphone (WASAPI) ────────┘
   timestamps, so sound and picture stay in sync (about 1 ms apart in our tests).
 - The picture always fills a 16:9 canvas; windows of other shapes get black bars,
   and resizing the window mid-stream just works.
+- The webcam is read in an uncompressed format near 720p (NV12, YUY2 or RGB), so
+  nothing needs decoding, and it's drawn as a second layer in the same
+  video-processor pass. With an Elgato Facecam Pro at 720p it adds about 0.3% CPU.
+  Cameras that only exist as DirectShow devices (OBS Virtual Camera, NVIDIA
+  Broadcast) don't show up yet.
 - Networking runs on its own thread, so a slow connection never stalls capture.
   When the upload can't keep up, MilerCast drops video until the next keyframe and
   keeps the audio. When the connection breaks, it reconnects and resumes at a
@@ -75,6 +83,7 @@ milercast-cli live --server twitch --window "Valorant"
 milercast-cli live --server youtube --window "Valorant" --out backup.flv   # stream and keep a copy
 milercast-cli record --window "Valorant" --seconds 60
 milercast-cli record --no-mic --desktop-volume 80 --height 720 --fps 30 --out clip.flv
+milercast-cli live --server youtube --window "Valorant" --camera "Facecam" --camera-corner bl --mirror
 ```
 
 `live` asks for your stream key without showing it on screen, or reads it from
@@ -100,7 +109,7 @@ cargo build --release
 2. Game audio (WASAPI loopback) and microphone. ✅
 3. Live streaming over RTMP to Twitch / YouTube. ✅ (v0.1)
 4. A window: game auto-detection, saved key, audio meters, presets, live status. ✅
-5. Webcam corner (and capture cards as a source).
+5. Webcam corner. ✅ (Capture cards as the main source are next.)
 6. Tray icon and hotkeys, game-only audio, RTMPS, automatic bitrate.
 
 ## License

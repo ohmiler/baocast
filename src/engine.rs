@@ -17,8 +17,9 @@ use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 
 use crate::aac::{self, AacEncoder};
 use crate::audio::{self, Gain, Mixer, Source as AudioSource, Timeline};
+use crate::camera::{Camera, Overlay};
 use crate::capture::{Capture, Poll, Target};
-use crate::convert::Converter;
+use crate::convert::{CameraLayer, Converter};
 use crate::encoder::{Encoder, Event};
 use crate::flv::{FlvFile, Muxer, Sink};
 use crate::gpu::Gpu;
@@ -46,6 +47,13 @@ pub struct Mic {
     pub gain: Gain,
 }
 
+pub struct CameraChoice {
+    /// Part of the device name; None for the first camera.
+    pub name: Option<String>,
+    /// Placement, shared with whoever wants to change it while live.
+    pub overlay: Arc<Overlay>,
+}
+
 pub struct Settings {
     pub video: Video,
     pub height: u32,
@@ -55,6 +63,7 @@ pub struct Settings {
     pub desktop_audio: Option<Gain>,
     pub mic: Option<Mic>,
     pub audio_kbps: u32,
+    pub camera: Option<CameraChoice>,
     /// (server, stream key) to go live.
     pub live: Option<(String, String)>,
     pub record_to: Option<PathBuf>,
@@ -208,7 +217,29 @@ fn run(s: Settings, state: &State) -> Result<(), Box<dyn Error>> {
     };
     let mut capture = Capture::new(&gpu, target)?;
     let canvas = canvas_size(capture.height, s.height);
-    let mut converter = Converter::new(&gpu, &capture.texture, (capture.width, capture.height), canvas, s.fps)?;
+
+    // Like audio devices, a camera that won't open is a warning, not an error.
+    let mut camera = None;
+    if let Some(choice) = &s.camera {
+        let opened = Camera::open(choice.name.as_deref()).and_then(|cam| {
+            let layer = CameraLayer::new(&gpu, (cam.width, cam.height), cam.format, choice.overlay.clone())
+                .map_err(|e| format!("can't make the camera texture: {}", e.message()))?;
+            Ok((cam, layer))
+        });
+        match opened {
+            Ok((cam, layer)) => {
+                state.note(format!("Camera : \"{}\" {}x{} {:?}", cam.name, cam.width, cam.height, cam.format));
+                camera = Some((cam, layer));
+            }
+            Err(e) => state.note(format!("warning: no camera: {e}")),
+        }
+    }
+    let layer = camera.as_ref().map(|(_, layer)| layer);
+    let mut converter = Converter::new(&gpu, &capture.texture, (capture.width, capture.height), canvas, s.fps, layer)?;
+    if let Some(problem) = &converter.camera_problem {
+        state.note(format!("warning: no camera: {problem}"));
+        camera = None;
+    }
     let encoder = Encoder::new(&gpu, canvas.0, canvas.1, s.fps, s.video_kbps * 1000)?;
 
     // A missing audio device is a warning, not an error: streaming without a
@@ -304,6 +335,8 @@ fn run(s: Settings, state: &State) -> Result<(), Box<dyn Error>> {
     let mut current = None;
     let mut first_time = None;
     let mut draining = false;
+    let mut camera_seen = 0;
+    let mut overlay_seen = None;
 
     loop {
         match encoder.next_event()? {
@@ -319,18 +352,44 @@ fn run(s: Settings, state: &State) -> Result<(), Box<dyn Error>> {
                         state.skipped.fetch_add(behind, Ordering::Relaxed);
                     }
                 }
+                // Redraw when the game or the camera has something new, or the
+                // camera was moved; otherwise the last picture is sent again.
+                let mut redraw = current.is_none();
+                if let Some((cam, layer)) = &camera {
+                    let uploaded = cam.with_new_frame(camera_seen, |frame| {
+                        let _ = layer.upload(&gpu.context, frame);
+                    });
+                    if let Some(sequence) = uploaded {
+                        camera_seen = sequence;
+                        redraw = true;
+                    }
+                    let placement = layer.overlay.snapshot();
+                    if overlay_seen != Some(placement) {
+                        overlay_seen = Some(placement);
+                        redraw = true;
+                    }
+                }
                 match capture.poll()? {
                     Poll::NewFrame => {
-                        current = Some(converter.convert()?);
+                        redraw = true;
                         state.captured.fetch_add(1, Ordering::Relaxed);
                     }
                     Poll::Resized => {
                         // Same canvas, new picture size: refit it; the next frame brings the content.
-                        converter =
-                            Converter::new(&gpu, &capture.texture, (capture.width, capture.height), canvas, s.fps)?;
+                        let layer = camera.as_ref().map(|(_, layer)| layer);
+                        converter = Converter::new(
+                            &gpu,
+                            &capture.texture,
+                            (capture.width, capture.height),
+                            canvas,
+                            s.fps,
+                            layer,
+                        )?;
                     }
-                    Poll::Unchanged if current.is_none() => current = Some(converter.convert()?),
                     Poll::Unchanged => {}
+                }
+                if redraw {
+                    current = Some(converter.convert()?);
                 }
                 if network.as_ref().is_some_and(Monitor::take_keyframe_request) {
                     encoder.force_keyframe();

@@ -16,8 +16,9 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::core::BOOL;
 
 use milercast::audio::{self, Gain};
+use milercast::camera::{self, Overlay};
 use milercast::capture;
-use milercast::engine::{Engine, Mic, Phase, Settings, State, Video};
+use milercast::engine::{CameraChoice, Engine, Mic, Phase, Settings, State, Video};
 use milercast::rtmp::{Monitor, Status};
 
 const USAGE: &str = "\
@@ -44,6 +45,12 @@ AUDIO (game sound and microphone are both on by default):
   --desktop-volume <pct>   Desktop audio volume, 0-200 (default 100)
   --mic-volume <pct>       Microphone volume, 0-200 (default 100)
   --audio-bitrate <kbps>   96, 128, 160 (default) or 192
+
+CAMERA (off by default):
+  --camera <text>          Show the camera whose name contains <text> in a corner
+  --camera-corner <c>      tl, tr, bl or br (default br)
+  --camera-size <s>        s, m (default) or l
+  --mirror                 Flip the camera left to right
 
 OUTPUT:
   --seconds <n>            Stop after n seconds (default: when you press Ctrl+C)
@@ -72,6 +79,10 @@ struct Options {
     seconds: Option<u64>,
     out: Option<PathBuf>,
     server: Option<String>,
+    camera: Option<String>,
+    camera_corner: u8,
+    camera_size: u8,
+    mirror: bool,
 }
 
 fn main() {
@@ -115,6 +126,10 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         seconds: None,
         out: None,
         server: None,
+        camera: None,
+        camera_corner: 3,
+        camera_size: 1,
+        mirror: false,
     };
     let mut args = args.iter();
     while let Some(flag) = args.next() {
@@ -134,6 +149,25 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             "--seconds" => o.seconds = Some(number(value()?)?),
             "--out" => o.out = Some(PathBuf::from(value()?)),
             "--server" => o.server = Some(value()?.clone()),
+            "--camera" => o.camera = Some(value()?.clone()),
+            "--camera-corner" => {
+                o.camera_corner = match value()?.as_str() {
+                    "tl" => 0,
+                    "tr" => 1,
+                    "bl" => 2,
+                    "br" => 3,
+                    other => return Err(format!("--camera-corner must be tl, tr, bl or br, not {other}")),
+                }
+            }
+            "--camera-size" => {
+                o.camera_size = match value()?.as_str() {
+                    "s" => 0,
+                    "m" => 1,
+                    "l" => 2,
+                    other => return Err(format!("--camera-size must be s, m or l, not {other}")),
+                }
+            }
+            "--mirror" => o.mirror = true,
             other => return Err(format!("unknown option {other}\n\n{USAGE}")),
         }
     }
@@ -167,6 +201,10 @@ fn list() -> Result<(), Box<dyn Error>> {
     for mic in audio::microphones()? {
         let marker = if mic.name == default { "  (default)" } else { "" };
         println!("  {}{marker}", mic.name);
+    }
+    println!("\nCameras:");
+    for camera in camera::cameras() {
+        println!("  {camera}");
     }
     Ok(())
 }
@@ -209,6 +247,10 @@ fn session(o: Options) -> Result<(), Box<dyn Error>> {
         desktop_audio: o.desktop_audio.then(|| Gain::new(o.desktop_volume as f32 / 100.0)),
         mic: o.mic.then(|| Mic { name: o.mic_name.clone(), gain: Gain::new(o.mic_volume as f32 / 100.0) }),
         audio_kbps: o.audio_bitrate_kbps,
+        camera: o.camera.clone().map(|name| CameraChoice {
+            name: Some(name),
+            overlay: Overlay::new(true, o.camera_corner, o.camera_size, o.mirror),
+        }),
         live: o.server.clone().zip(key),
         record_to,
         stop_after: o.seconds.map(Duration::from_secs),
